@@ -1,0 +1,1842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SUPERHOT DUPE</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #111;
+    height: 100%;
+    overflow: hidden;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+  }
+  #wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+  }
+  canvas {
+    background: #dcdcdc;
+    cursor: crosshair;
+    box-shadow: 0 0 40px rgba(0,0,0,0.6);
+  }
+  #hint {
+    position: fixed;
+    bottom: 12px;
+    left: 0;
+    right: 0;
+    text-align: center;
+    color: #888;
+    font-size: 13px;
+    letter-spacing: 1px;
+    user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="900" height="600"></canvas>
+</div>
+<div id="hint">WASD MOVE &nbsp;•&nbsp; LEFT-CLICK: SHOOT / PUNCH &nbsp;•&nbsp; Q / SPACE / RIGHT-CLICK: THROW &nbsp;•&nbsp; WALK OVER GUNS TO GRAB &nbsp;•&nbsp; R: RESTART &nbsp;•&nbsp; ESC: LEVEL SELECT &nbsp;•&nbsp; TIME MOVES WHEN YOU MOVE</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width;
+  const H = canvas.height;
+
+  // ---- Palette ----
+  const COL = {
+    floor:   "#dcdcdc",
+    wall:    "#b8b8b8",
+    wallEdge:"#9a9a9a",
+    player:  "#111111",
+    enemy:   "#e63028",
+    enemyDk: "#a8221c",
+    trail:   "#111111",
+    accent:  "#111111",
+  };
+
+  // ---- Room ----
+  const room = { x: 40, y: 40, w: W - 80, h: H - 80 };
+
+  // ---- Input ----
+  const keys = {};
+  const mouse = { x: W / 2, y: H / 2 };
+
+  window.addEventListener("keydown", e => {
+    const k = e.key.toLowerCase();
+    keys[k] = true;
+    if (k === "r" && state === STATE.PLAYING) restartLevel();  // manual retry
+    if (k === "escape") state = STATE.SELECT;                   // open level select
+    // Q or Space throws (trackpad-friendly alt to right-click). Ignore key-repeat.
+    if (!e.repeat && (k === "q" || k === " ") && state === STATE.PLAYING) doThrow();
+    // prevent page scroll on arrows/space
+    if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k)) e.preventDefault();
+  });
+  window.addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+
+  canvas.addEventListener("mousemove", e => {
+    const r = canvas.getBoundingClientRect();
+    mouse.x = (e.clientX - r.left) * (W / r.width);
+    mouse.y = (e.clientY - r.top) * (H / r.height);
+  });
+
+  canvas.addEventListener("mousedown", e => {
+    if (e.button === 0 && state === STATE.WON) { state = STATE.SELECT; return; }
+    if (state === STATE.SELECT) {
+      if (e.button !== 0) return;
+      for (const cell of selectCells()) {
+        if (mouse.x >= cell.x && mouse.x <= cell.x + cell.w &&
+            mouse.y >= cell.y && mouse.y <= cell.y + cell.h) {
+          loadLevel(cell.idx);
+          break;
+        }
+      }
+      return;
+    }
+    if (state !== STATE.PLAYING) return;
+    if (e.button === 0) {
+      if (player.ammo > 0) doShoot();  // loaded -> fire
+      else doMelee();                  // empty or bare-handed -> punch
+    } else if (e.button === 2) {
+      doThrow();                       // right-click -> hurl your gun (even empty)
+    }
+  });
+  canvas.addEventListener("contextmenu", e => e.preventDefault());
+
+  // ---- Player ----
+  const player = {
+    x: W / 2,
+    y: H / 2,
+    r: 12,
+    speed: 260,        // px/sec at full tilt (real time, not time-scaled)
+    vx: 0,
+    vy: 0,
+    hasGun: false,     // holding a weapon? (an EMPTY gun still counts — throwable)
+    ammo: 0,           // rounds left in the held gun
+  };
+  const PLAYER_MAX_AMMO = 6;
+
+  // Guns dropped by dead enemies, waiting to be picked up.
+  const pickups = [];   // { x, y, ammo, r }
+  const PICKUP_R = 11;
+
+  // ---- Enemies ----
+  //   gunner   : static, aims + fires 1 shot, drops a gun (2 rounds).
+  //   shotgun  : static, fires a 3-pellet spread, drops a gun (3 rounds).
+  //   sniper   : static, fires a single FAST bullet on a short cooldown.
+  //   dodger   : gunner that STRAFES out of the way of incoming shots/throws.
+  //   bomber   : lobs a grenade to your position that detonates in a radius,
+  //              ignoring walls — punishes camping cover.
+  //   rusher   : unarmed, charges the player, kills on contact, no drop.
+  //   brute    : big + fast rusher, no drop. A wall of a man.
+  // Firing types only shoot when they have line-of-sight (walls = cover).
+  function makeEnemy(x, y, type, mobile) {
+    type = type || "gunner";
+    const e = {
+      x, y, r: 13,
+      type,
+      aim: 0,
+      cooldown: 1.4,      // seconds (in time-scaled world) between shots
+      timer: 0.6 + Math.random() * 0.9,
+      pellets: 1,         // bullets per volley (shotgun > 1)
+      spread: 0,          // radians between spread pellets
+      bulletSpeed: 300,   // per-enemy bullet speed
+      speed: 135,         // charge speed (rushers/brutes)
+      dodgeSpeed: 0,      // strafe speed when evading (dodger)
+      mobile: !!mobile,   // shooter that advances while firing
+      moveSpeed: 118,     // advance/retreat speed when mobile
+      engageRange: 250,   // preferred distance a mobile shooter holds
+      alive: true,
+    };
+    if (type === "shotgun") { e.pellets = 3; e.spread = 0.30; e.cooldown = 1.9; e.engageRange = 190; }
+    if (type === "sniper")  { e.cooldown = 1.05; e.bulletSpeed = 500; e.engageRange = 320; }
+    if (type === "dodger")  { e.cooldown = 1.25; e.dodgeSpeed = 185; }
+    if (type === "bomber")  { e.cooldown = 2.6; e.r = 14; e.timer = 1.2 + Math.random(); }
+    if (type === "rusher")  { e.speed = 135; }
+    if (type === "brute")   { e.speed = 210; e.r = 21; }
+    return e;
+  }
+  const isCharger = en => en.type === "rusher" || en.type === "brute";
+  const isShooter = en => en.type === "gunner" || en.type === "shotgun" ||
+                          en.type === "sniper" || en.type === "dodger";
+  let enemies = [];           // populated by loadLevel()
+
+  // Build an enemy from a level def ({fx,fy,t}); UPPERCASE t = mobile shooter.
+  function makeEnemyFromDef(e) {
+    const mobile = e.t !== e.t.toLowerCase();
+    return makeEnemy(room.x + room.w * e.fx, room.y + room.h * e.fy,
+                     TYPE_MAP[e.t.toLowerCase()] || "gunner", mobile);
+  }
+
+  // Give all living bombers a shared, evenly-staggered rhythm so their bombs
+  // land on a steady beat (~one every BOMB_INTERVAL) instead of a synced volley.
+  function restaggerBombers() {
+    const bombers = enemies.filter(en => en.alive && en.type === "bomber");
+    bombers.forEach((b, k) => {
+      b.cooldown = BOMB_INTERVAL * bombers.length;
+      b.timer = 0.9 + k * BOMB_INTERVAL;
+    });
+  }
+
+  // Bomber ordnance.
+  const grenades = [];   // in-flight: { x, y, tx, ty, vx, vy }
+  const blasts = [];     // landed/pending + detonation fx: { x, y, fuse, r, boom }
+  const GRENADE_SPEED = 300;  // travel speed toward target (time-scaled)
+  const BLAST_FUSE = 0.85;    // world-seconds from landing to detonation
+  const BLAST_R = 74;         // kill radius
+  // Bombers in a level share a rhythm: collectively ~one bomb per this many
+  // world-seconds, evenly staggered — so 5 bombers spread their throws out
+  // instead of firing as a synced volley.
+  const BOMB_INTERVAL = 1.0;
+  // Lightly predictive aim: lob ahead of the player's movement (+ scatter),
+  // so you can't dodge just by holding your current direction.
+  const BOMB_LEAD = 102;      // px thrown ahead along the player's heading
+  // The scatter is ammo-scaled. Let a = clamp(ammo / BOMB_AMMO_REF, 0, 1):
+  //   at a=0 (desperate for a gun): strong pull toward your nearest dropped
+  //     weapon + loose spread (contest the resupply).
+  //   at a=1 (well-stocked): no weapon pull + tight spread aimed at YOU.
+  const BOMB_AMMO_REF = 4;    // ammo count at which the aim is fully "on you"
+  const BOMB_WEAPON_BIAS = 46; // max px lean toward the gun (at 0 ammo)
+  const BOMB_SCATTER_MAX = 56; // spread at 0 ammo (loose)
+  const BOMB_SCATTER_MIN = 28; // spread when well-stocked (tight, on-target)
+
+  // Interior walls (cover). Absolute rects, populated by loadLevel().
+  let obstacles = [];         // { x, y, w, h }
+
+  // Bullets travel only when time flows (their motion is time-scaled).
+  const bullets = [];   // { x, y, vx, vy, life, px, py, owner }
+  const BULLET_SPEED = 300;   // px/sec of world time
+  const BULLET_R = 4;
+
+  // Thrown weapons: fly time-scaled, one-shot an enemy, then land as a pickup.
+  const thrown = [];    // { x, y, px, py, vx, vy, ammo, rot, vrot, dist, r }
+  const THROW_SPEED = 460;    // px/sec of world time (a real hurl)
+  const THROW_MAX_DIST = 1300;
+  const THROW_R = 12;
+
+  // Fragments from shattered enemies (also time-scaled — freeze mid-air).
+  const shards = [];    // { x, y, vx, vy, rot, vrot, size, life, maxLife }
+
+  // ---- Melee ----
+  const MELEE_RANGE = 46;         // reach past player edge
+  const MELEE_ARC = Math.PI * 0.6; // forward cone half-width-ish
+  let meleeSwing = 0;             // >0 while swing anim plays (real time)
+  const MELEE_SWING_TIME = 0.14;
+
+  // Brief red overlay flash on player death.
+  let hitFlash = 0;
+
+  // ---- Levels ----
+  // Coords are fractions of the room (0..1).
+  //   t: g=gunner  s=shotgunner  r=rusher  b=brute
+  //   walls: {fx,fy,fw,fh} cover rectangles (fractions of room).
+  //   ammo: rounds the player starts the level with.
+  const LEVELS = [
+    { // 1: lone gunner — learn to close in and punch
+      player: { fx: 0.5, fy: 0.85, ammo: 0 },
+      walls: [],
+      enemies: [ { fx: 0.5, fy: 0.20, t: "g" } ],
+    },
+    { // 2: two gunners + a center pillar for cover
+      player: { fx: 0.5, fy: 0.88, ammo: 0 },
+      walls: [ { fx: 0.42, fy: 0.42, fw: 0.16, fh: 0.16 } ],
+      enemies: [ { fx: 0.20, fy: 0.22, t: "g" }, { fx: 0.80, fy: 0.22, t: "g" } ],
+    },
+    { // 3: a rusher forces you out of cover into the gunner's line
+      player: { fx: 0.5, fy: 0.85, ammo: 0 },
+      walls: [ { fx: 0.30, fy: 0.45, fw: 0.40, fh: 0.10 } ],
+      enemies: [ { fx: 0.5, fy: 0.18, t: "g" }, { fx: 0.15, fy: 0.6, t: "r" } ],
+    },
+    { // 4: meet the shotgunner — do NOT stand in the open
+      player: { fx: 0.5, fy: 0.88, ammo: 2 },
+      walls: [
+        { fx: 0.15, fy: 0.40, fw: 0.10, fh: 0.28 },
+        { fx: 0.75, fy: 0.40, fw: 0.10, fh: 0.28 },
+      ],
+      enemies: [
+        { fx: 0.5, fy: 0.18, t: "s" },
+        { fx: 0.20, fy: 0.25, t: "g" }, { fx: 0.80, fy: 0.25, t: "g" },
+      ],
+    },
+    { // 5: meet the brute — big, fast, unkillable-by-waiting
+      player: { fx: 0.5, fy: 0.88, ammo: 0 },
+      walls: [ { fx: 0.30, fy: 0.30, fw: 0.10, fh: 0.40 },
+               { fx: 0.60, fy: 0.30, fw: 0.10, fh: 0.40 } ],
+      enemies: [
+        { fx: 0.15, fy: 0.20, t: "g" }, { fx: 0.85, fy: 0.20, t: "g" },
+        { fx: 0.5, fy: 0.30, t: "b" },
+      ],
+    },
+    { // 6: corridor — two shotgunners down a lane, rushers flanking
+      player: { fx: 0.5, fy: 0.90, ammo: 3 },
+      walls: [ { fx: 0.30, fy: 0.20, fw: 0.08, fh: 0.55 },
+               { fx: 0.62, fy: 0.20, fw: 0.08, fh: 0.55 } ],
+      enemies: [
+        { fx: 0.5, fy: 0.14, t: "s" }, { fx: 0.5, fy: 0.30, t: "s" },
+        { fx: 0.15, fy: 0.45, t: "r" }, { fx: 0.85, fy: 0.45, t: "r" },
+      ],
+    },
+    { // 7: crossfire maze
+      player: { fx: 0.5, fy: 0.90, ammo: 2 },
+      walls: [
+        { fx: 0.20, fy: 0.30, fw: 0.22, fh: 0.08 },
+        { fx: 0.58, fy: 0.30, fw: 0.22, fh: 0.08 },
+        { fx: 0.42, fy: 0.55, fw: 0.16, fh: 0.16 },
+      ],
+      enemies: [
+        { fx: 0.14, fy: 0.16, t: "g" }, { fx: 0.86, fy: 0.16, t: "g" },
+        { fx: 0.5, fy: 0.16, t: "s" },
+        { fx: 0.20, fy: 0.60, t: "b" }, { fx: 0.80, fy: 0.60, t: "r" },
+      ],
+    },
+    { // 8: the gauntlet
+      player: { fx: 0.5, fy: 0.92, ammo: 3 },
+      walls: [
+        { fx: 0.10, fy: 0.35, fw: 0.20, fh: 0.08 },
+        { fx: 0.70, fy: 0.35, fw: 0.20, fh: 0.08 },
+        { fx: 0.44, fy: 0.18, fw: 0.12, fh: 0.30 },
+      ],
+      enemies: [
+        { fx: 0.14, fy: 0.14, t: "s" }, { fx: 0.86, fy: 0.14, t: "s" },
+        { fx: 0.30, fy: 0.14, t: "g" }, { fx: 0.70, fy: 0.14, t: "g" },
+        { fx: 0.25, fy: 0.55, t: "b" }, { fx: 0.75, fy: 0.55, t: "r" },
+      ],
+    },
+    { // 9: meet the sniper — fast bullets, use cover or die
+      player: { fx: 0.5, fy: 0.90, ammo: 0 },
+      walls: [
+        { fx: 0.22, fy: 0.45, fw: 0.14, fh: 0.10 },
+        { fx: 0.64, fy: 0.45, fw: 0.14, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.20, fy: 0.16, t: "x" }, { fx: 0.80, fy: 0.16, t: "x" },
+        { fx: 0.5, fy: 0.20, t: "g" }, { fx: 0.5, fy: 0.55, t: "r" },
+      ],
+    },
+    { // 10: brute pincer — two big men, minimal cover
+      player: { fx: 0.5, fy: 0.85, ammo: 2 },
+      walls: [ { fx: 0.44, fy: 0.40, fw: 0.12, fh: 0.12 } ],
+      enemies: [
+        { fx: 0.12, fy: 0.30, t: "b" }, { fx: 0.88, fy: 0.30, t: "b" },
+        { fx: 0.30, fy: 0.14, t: "g" }, { fx: 0.70, fy: 0.14, t: "g" },
+        { fx: 0.5, fy: 0.12, t: "s" },
+      ],
+    },
+    { // 11: the firing line — 3 snipers, cover is your only friend
+      player: { fx: 0.5, fy: 0.92, ammo: 0 },
+      walls: [
+        { fx: 0.14, fy: 0.42, fw: 0.16, fh: 0.09 },
+        { fx: 0.42, fy: 0.52, fw: 0.16, fh: 0.09 },
+        { fx: 0.70, fy: 0.42, fw: 0.16, fh: 0.09 },
+      ],
+      enemies: [
+        { fx: 0.16, fy: 0.14, t: "x" }, { fx: 0.5, fy: 0.12, t: "x" }, { fx: 0.84, fy: 0.14, t: "x" },
+        { fx: 0.30, fy: 0.30, t: "r" }, { fx: 0.70, fy: 0.30, t: "r" },
+      ],
+    },
+    { // 12: the meat grinder — shotguns up front, brutes behind
+      player: { fx: 0.5, fy: 0.92, ammo: 3 },
+      walls: [
+        { fx: 0.26, fy: 0.30, fw: 0.10, fh: 0.34 },
+        { fx: 0.64, fy: 0.30, fw: 0.10, fh: 0.34 },
+      ],
+      enemies: [
+        { fx: 0.5, fy: 0.14, t: "s" }, { fx: 0.30, fy: 0.20, t: "s" }, { fx: 0.70, fy: 0.20, t: "s" },
+        { fx: 0.14, fy: 0.50, t: "b" }, { fx: 0.86, fy: 0.50, t: "b" },
+      ],
+    },
+    { // 13: crossfire cathedral — snipers, gunners, a brute down the nave
+      player: { fx: 0.5, fy: 0.93, ammo: 2 },
+      walls: [
+        { fx: 0.20, fy: 0.24, fw: 0.08, fh: 0.44 },
+        { fx: 0.72, fy: 0.24, fw: 0.08, fh: 0.44 },
+        { fx: 0.44, fy: 0.60, fw: 0.12, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.12, fy: 0.16, t: "x" }, { fx: 0.88, fy: 0.16, t: "x" },
+        { fx: 0.34, fy: 0.14, t: "g" }, { fx: 0.66, fy: 0.14, t: "g" },
+        { fx: 0.5, fy: 0.16, t: "s" }, { fx: 0.5, fy: 0.40, t: "b" },
+      ],
+    },
+    { // 14: the swarm — seven bodies, everything at once
+      player: { fx: 0.5, fy: 0.93, ammo: 3 },
+      walls: [
+        { fx: 0.30, fy: 0.34, fw: 0.10, fh: 0.10 },
+        { fx: 0.60, fy: 0.34, fw: 0.10, fh: 0.10 },
+        { fx: 0.45, fy: 0.58, fw: 0.10, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.12, fy: 0.14, t: "x" }, { fx: 0.88, fy: 0.14, t: "x" },
+        { fx: 0.32, fy: 0.14, t: "s" }, { fx: 0.68, fy: 0.14, t: "s" },
+        { fx: 0.5, fy: 0.12, t: "g" },
+        { fx: 0.16, fy: 0.48, t: "b" }, { fx: 0.84, fy: 0.48, t: "r" },
+      ],
+    },
+    { // 15: THE WALL — nine enemies, three snipers, three brutes. Good luck.
+      player: { fx: 0.5, fy: 0.94, ammo: 3 },
+      walls: [
+        { fx: 0.16, fy: 0.40, fw: 0.16, fh: 0.08 },
+        { fx: 0.68, fy: 0.40, fw: 0.16, fh: 0.08 },
+        { fx: 0.44, fy: 0.24, fw: 0.12, fh: 0.24 },
+      ],
+      enemies: [
+        { fx: 0.10, fy: 0.12, t: "x" }, { fx: 0.5, fy: 0.10, t: "x" }, { fx: 0.90, fy: 0.12, t: "x" },
+        { fx: 0.28, fy: 0.14, t: "s" }, { fx: 0.72, fy: 0.14, t: "s" },
+        { fx: 0.14, fy: 0.55, t: "b" }, { fx: 0.5, fy: 0.40, t: "b" }, { fx: 0.86, fy: 0.55, t: "b" },
+        { fx: 0.5, fy: 0.62, t: "r" },
+      ],
+    },
+    { // 16: kill box — four snipers box you in, brutes flush you out
+      player: { fx: 0.5, fy: 0.94, ammo: 3 },
+      walls: [
+        { fx: 0.30, fy: 0.34, fw: 0.09, fh: 0.30 },
+        { fx: 0.61, fy: 0.34, fw: 0.09, fh: 0.30 },
+        { fx: 0.44, fy: 0.66, fw: 0.12, fh: 0.09 },
+      ],
+      enemies: [
+        { fx: 0.10, fy: 0.12, t: "x" }, { fx: 0.90, fy: 0.12, t: "x" },
+        { fx: 0.10, fy: 0.40, t: "x" }, { fx: 0.90, fy: 0.40, t: "x" },
+        { fx: 0.38, fy: 0.13, t: "s" }, { fx: 0.62, fy: 0.13, t: "s" },
+        { fx: 0.5, fy: 0.22, t: "b" }, { fx: 0.20, fy: 0.60, t: "b" }, { fx: 0.80, fy: 0.60, t: "b" },
+        { fx: 0.5, fy: 0.70, t: "r" },
+      ],
+    },
+    { // 17: no man's land — almost no cover, keep moving or die
+      player: { fx: 0.5, fy: 0.95, ammo: 4 },
+      walls: [
+        { fx: 0.16, fy: 0.55, fw: 0.12, fh: 0.08 },
+        { fx: 0.72, fy: 0.55, fw: 0.12, fh: 0.08 },
+      ],
+      enemies: [
+        { fx: 0.10, fy: 0.12, t: "x" }, { fx: 0.34, fy: 0.11, t: "x" },
+        { fx: 0.66, fy: 0.11, t: "x" }, { fx: 0.90, fy: 0.12, t: "x" },
+        { fx: 0.22, fy: 0.24, t: "s" }, { fx: 0.5, fy: 0.20, t: "s" }, { fx: 0.78, fy: 0.24, t: "s" },
+        { fx: 0.14, fy: 0.42, t: "b" }, { fx: 0.86, fy: 0.42, t: "b" },
+        { fx: 0.40, fy: 0.40, t: "r" }, { fx: 0.60, fy: 0.40, t: "r" },
+      ],
+    },
+    { // 18: THE FORTRESS — twelve enemies, the final wall. Beat this and you've won everything.
+      player: { fx: 0.5, fy: 0.95, ammo: 4 },
+      walls: [
+        { fx: 0.14, fy: 0.40, fw: 0.14, fh: 0.08 },
+        { fx: 0.72, fy: 0.40, fw: 0.14, fh: 0.08 },
+        { fx: 0.42, fy: 0.20, fw: 0.16, fh: 0.10 },
+        { fx: 0.44, fy: 0.60, fw: 0.12, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.09, fy: 0.11, t: "x" }, { fx: 0.5, fy: 0.09, t: "x" }, { fx: 0.91, fy: 0.11, t: "x" },
+        { fx: 0.26, fy: 0.12, t: "s" }, { fx: 0.74, fy: 0.12, t: "s" }, { fx: 0.5, fy: 0.34, t: "s" },
+        { fx: 0.34, fy: 0.13, t: "g" }, { fx: 0.66, fy: 0.13, t: "g" },
+        { fx: 0.12, fy: 0.55, t: "b" }, { fx: 0.88, fy: 0.55, t: "b" }, { fx: 0.5, fy: 0.48, t: "b" },
+        { fx: 0.5, fy: 0.70, t: "r" },
+      ],
+    },
+    { // 19: meet the DODGER — slow shots get strafed; close in or bait it
+      player: { fx: 0.5, fy: 0.88, ammo: 2 },
+      walls: [ { fx: 0.44, fy: 0.44, fw: 0.12, fh: 0.12 } ],
+      enemies: [
+        { fx: 0.28, fy: 0.20, t: "d" }, { fx: 0.72, fy: 0.20, t: "d" },
+        { fx: 0.5, fy: 0.16, t: "g" }, { fx: 0.15, fy: 0.55, t: "r" },
+      ],
+    },
+    { // 20: meet the BOMBER — its grenade ignores walls, so keep moving
+      player: { fx: 0.5, fy: 0.90, ammo: 2 },
+      walls: [
+        { fx: 0.20, fy: 0.42, fw: 0.14, fh: 0.10 },
+        { fx: 0.66, fy: 0.42, fw: 0.14, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.5, fy: 0.16, t: "m" },
+        { fx: 0.18, fy: 0.20, t: "g" }, { fx: 0.82, fy: 0.20, t: "g" },
+        { fx: 0.5, fy: 0.55, t: "r" },
+      ],
+    },
+    { // 21: dodgers + a bomber — aim is unsafe AND cover is unsafe
+      player: { fx: 0.5, fy: 0.92, ammo: 3 },
+      walls: [
+        { fx: 0.26, fy: 0.30, fw: 0.10, fh: 0.30 },
+        { fx: 0.64, fy: 0.30, fw: 0.10, fh: 0.30 },
+      ],
+      enemies: [
+        { fx: 0.18, fy: 0.16, t: "d" }, { fx: 0.82, fy: 0.16, t: "d" },
+        { fx: 0.5, fy: 0.13, t: "m" },
+        { fx: 0.5, fy: 0.34, t: "s" },
+        { fx: 0.14, fy: 0.55, t: "b" }, { fx: 0.86, fy: 0.55, t: "r" },
+      ],
+    },
+    { // 22: dodger nest — bomb flushes you out, dodgers punish the open
+      player: { fx: 0.5, fy: 0.92, ammo: 3 },
+      walls: [
+        { fx: 0.18, fy: 0.32, fw: 0.14, fh: 0.09 },
+        { fx: 0.68, fy: 0.32, fw: 0.14, fh: 0.09 },
+        { fx: 0.44, fy: 0.58, fw: 0.12, fh: 0.12 },
+      ],
+      enemies: [
+        { fx: 0.16, fy: 0.15, t: "d" }, { fx: 0.5, fy: 0.13, t: "d" }, { fx: 0.84, fy: 0.15, t: "d" },
+        { fx: 0.5, fy: 0.30, t: "m" },
+        { fx: 0.20, fy: 0.55, t: "r" }, { fx: 0.80, fy: 0.55, t: "b" },
+      ],
+    },
+    { // 23: one of everything — the full menagerie
+      player: { fx: 0.5, fy: 0.93, ammo: 2 },
+      walls: [
+        { fx: 0.24, fy: 0.28, fw: 0.09, fh: 0.30 },
+        { fx: 0.67, fy: 0.28, fw: 0.09, fh: 0.30 },
+      ],
+      enemies: [
+        { fx: 0.12, fy: 0.14, t: "x" }, { fx: 0.88, fy: 0.14, t: "s" },
+        { fx: 0.34, fy: 0.13, t: "d" }, { fx: 0.66, fy: 0.13, t: "g" },
+        { fx: 0.5, fy: 0.16, t: "m" },
+        { fx: 0.18, fy: 0.52, t: "b" }, { fx: 0.82, fy: 0.52, t: "r" },
+      ],
+    },
+    { // 24: bombardment — twin bombers + snipers, never stop moving
+      player: { fx: 0.5, fy: 0.94, ammo: 3 },
+      walls: [
+        { fx: 0.14, fy: 0.44, fw: 0.16, fh: 0.08 },
+        { fx: 0.70, fy: 0.44, fw: 0.16, fh: 0.08 },
+        { fx: 0.44, fy: 0.24, fw: 0.12, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.26, fy: 0.14, t: "m" }, { fx: 0.74, fy: 0.14, t: "m" },
+        { fx: 0.10, fy: 0.16, t: "x" }, { fx: 0.90, fy: 0.16, t: "x" },
+        { fx: 0.5, fy: 0.12, t: "d" },
+        { fx: 0.30, fy: 0.55, t: "r" }, { fx: 0.70, fy: 0.55, t: "b" },
+      ],
+    },
+    { // 25: THE GRAND FINALE — everything, everywhere, all at once
+      player: { fx: 0.5, fy: 0.95, ammo: 4 },
+      walls: [
+        { fx: 0.14, fy: 0.38, fw: 0.15, fh: 0.08 },
+        { fx: 0.71, fy: 0.38, fw: 0.15, fh: 0.08 },
+        { fx: 0.42, fy: 0.20, fw: 0.16, fh: 0.10 },
+        { fx: 0.44, fy: 0.60, fw: 0.12, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.09, fy: 0.11, t: "x" }, { fx: 0.5, fy: 0.08, t: "x" }, { fx: 0.91, fy: 0.11, t: "x" },
+        { fx: 0.24, fy: 0.12, t: "d" }, { fx: 0.76, fy: 0.12, t: "d" },
+        { fx: 0.34, fy: 0.14, t: "m" }, { fx: 0.66, fy: 0.14, t: "m" },
+        { fx: 0.5, fy: 0.30, t: "s" },
+        { fx: 0.12, fy: 0.55, t: "b" }, { fx: 0.88, fy: 0.55, t: "b" }, { fx: 0.5, fy: 0.46, t: "b" },
+        { fx: 0.28, fy: 0.62, t: "r" }, { fx: 0.72, fy: 0.62, t: "r" },
+      ],
+    },
+    { // 26: THE HUNT — mobile gunners advance on you; cover only stalls them
+      player: { fx: 0.5, fy: 0.90, ammo: 2 },
+      walls: [
+        { fx: 0.30, fy: 0.40, fw: 0.12, fh: 0.12 },
+        { fx: 0.58, fy: 0.40, fw: 0.12, fh: 0.12 },
+      ],
+      enemies: [
+        { fx: 0.20, fy: 0.18, t: "G" }, { fx: 0.80, fy: 0.18, t: "G" },
+        { fx: 0.5, fy: 0.15, t: "g" }, { fx: 0.5, fy: 0.30, t: "G" },
+      ],
+    },
+    { // 27: RUNNING GUN — mobile snipers + a mobile dodger stalk you
+      player: { fx: 0.5, fy: 0.92, ammo: 3 },
+      walls: [
+        { fx: 0.22, fy: 0.30, fw: 0.10, fh: 0.34 },
+        { fx: 0.68, fy: 0.30, fw: 0.10, fh: 0.34 },
+      ],
+      enemies: [
+        { fx: 0.14, fy: 0.16, t: "X" }, { fx: 0.86, fy: 0.16, t: "X" },
+        { fx: 0.5, fy: 0.14, t: "D" },
+        { fx: 0.5, fy: 0.34, t: "S" },
+        { fx: 0.5, fy: 0.60, t: "r" },
+      ],
+    },
+    { // 28: NOWHERE TO HIDE — everything mobile, everything hunting
+      player: { fx: 0.5, fy: 0.94, ammo: 4 },
+      walls: [
+        { fx: 0.16, fy: 0.40, fw: 0.14, fh: 0.08 },
+        { fx: 0.70, fy: 0.40, fw: 0.14, fh: 0.08 },
+        { fx: 0.44, fy: 0.22, fw: 0.12, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.10, fy: 0.13, t: "X" }, { fx: 0.90, fy: 0.13, t: "X" },
+        { fx: 0.30, fy: 0.14, t: "D" }, { fx: 0.70, fy: 0.14, t: "D" },
+        { fx: 0.5, fy: 0.12, t: "G" }, { fx: 0.5, fy: 0.30, t: "m" },
+        { fx: 0.18, fy: 0.55, t: "b" }, { fx: 0.82, fy: 0.55, t: "b" },
+        { fx: 0.5, fy: 0.62, t: "r" },
+      ],
+    },
+    { // 29: MIXED DOCTRINE — a static AND a mobile of every shooter type.
+      //   lowercase = holds position, UPPERCASE = flanks your cover.
+      player: { fx: 0.5, fy: 0.93, ammo: 3 },
+      walls: [
+        { fx: 0.24, fy: 0.30, fw: 0.10, fh: 0.30 },
+        { fx: 0.66, fy: 0.30, fw: 0.10, fh: 0.30 },
+        { fx: 0.44, fy: 0.62, fw: 0.12, fh: 0.10 },
+      ],
+      enemies: [
+        { fx: 0.12, fy: 0.14, t: "x" }, { fx: 0.88, fy: 0.14, t: "X" },  // sniper: static | mobile
+        { fx: 0.30, fy: 0.13, t: "g" }, { fx: 0.70, fy: 0.13, t: "G" },  // gunner: static | mobile
+        { fx: 0.40, fy: 0.24, t: "d" }, { fx: 0.60, fy: 0.24, t: "D" },  // dodger: static | mobile
+        { fx: 0.5,  fy: 0.14, t: "s" }, { fx: 0.5,  fy: 0.40, t: "S" },  // shotgun: static | mobile
+        { fx: 0.16, fy: 0.55, t: "r" }, { fx: 0.84, fy: 0.55, t: "b" },  // rusher + brute pressure
+      ],
+    },
+    { // 30: THE BARRAGE — our biggest. Five bombers keep the floor on fire;
+      //   never stop moving. Full static/mobile mix + melee pressure. 18 bodies.
+      player: { fx: 0.5, fy: 0.95, ammo: 5 },
+      walls: [
+        { fx: 0.14, fy: 0.40, fw: 0.14, fh: 0.08 },
+        { fx: 0.72, fy: 0.40, fw: 0.14, fh: 0.08 },
+        { fx: 0.44, fy: 0.22, fw: 0.12, fh: 0.10 },
+        { fx: 0.30, fy: 0.62, fw: 0.10, fh: 0.10 },
+        { fx: 0.60, fy: 0.62, fw: 0.10, fh: 0.10 },
+      ],
+      enemies: [
+        // five bombers, spread wide — staggered fuses = constant bomb pressure
+        { fx: 0.10, fy: 0.10, t: "m" }, { fx: 0.50, fy: 0.09, t: "m" }, { fx: 0.90, fy: 0.10, t: "m" },
+        { fx: 0.28, fy: 0.30, t: "m" }, { fx: 0.72, fy: 0.30, t: "m" },
+        // snipers: static + mobile
+        { fx: 0.20, fy: 0.14, t: "x" }, { fx: 0.80, fy: 0.14, t: "X" },
+        // gunners: static + mobile + static center
+        { fx: 0.36, fy: 0.12, t: "g" }, { fx: 0.64, fy: 0.12, t: "G" }, { fx: 0.5, fy: 0.34, t: "g" },
+        // dodgers: static + mobile
+        { fx: 0.40, fy: 0.20, t: "d" }, { fx: 0.60, fy: 0.20, t: "D" },
+        // shotguns: static + mobile
+        { fx: 0.14, fy: 0.30, t: "s" }, { fx: 0.86, fy: 0.30, t: "S" },
+        // melee pressure
+        { fx: 0.16, fy: 0.55, t: "b" }, { fx: 0.84, fy: 0.55, t: "b" },
+        { fx: 0.36, fy: 0.58, t: "r" }, { fx: 0.64, fy: 0.58, t: "r" },
+      ],
+    },
+    { // 31: BEAT THE CLOCK — 21 enemies, 7 walls, AND a survival timer.
+      //   The clock only burns while you move; run out and you're dead.
+      player: { fx: 0.5, fy: 0.95, ammo: 5 },
+      time: 17,   // world-seconds (ticks only while time flows)
+      walls: [
+        { fx: 0.12, fy: 0.30, fw: 0.12, fh: 0.08 },
+        { fx: 0.76, fy: 0.30, fw: 0.12, fh: 0.08 },
+        { fx: 0.30, fy: 0.42, fw: 0.08, fh: 0.24 },
+        { fx: 0.62, fy: 0.42, fw: 0.08, fh: 0.24 },
+        { fx: 0.44, fy: 0.16, fw: 0.12, fh: 0.10 },
+        { fx: 0.16, fy: 0.66, fw: 0.10, fh: 0.08 },
+        { fx: 0.74, fy: 0.66, fw: 0.10, fh: 0.08 },
+      ],
+      enemies: [
+        // five bombers keep the floor burning on a ~1s beat
+        { fx: 0.08, fy: 0.10, t: "m" }, { fx: 0.50, fy: 0.08, t: "m" }, { fx: 0.92, fy: 0.10, t: "m" },
+        { fx: 0.28, fy: 0.30, t: "m" }, { fx: 0.72, fy: 0.30, t: "m" },
+        // snipers: static + two mobile
+        { fx: 0.20, fy: 0.13, t: "x" }, { fx: 0.80, fy: 0.13, t: "X" }, { fx: 0.50, fy: 0.34, t: "X" },
+        // gunners: static + mobile pairs
+        { fx: 0.32, fy: 0.12, t: "g" }, { fx: 0.68, fy: 0.12, t: "G" },
+        { fx: 0.12, fy: 0.45, t: "g" }, { fx: 0.88, fy: 0.45, t: "G" },
+        // dodgers: static + mobile
+        { fx: 0.40, fy: 0.24, t: "d" }, { fx: 0.60, fy: 0.24, t: "D" },
+        // shotguns: static + mobile
+        { fx: 0.24, fy: 0.40, t: "s" }, { fx: 0.76, fy: 0.40, t: "S" },
+        // heavy melee wall
+        { fx: 0.16, fy: 0.58, t: "b" }, { fx: 0.84, fy: 0.58, t: "b" }, { fx: 0.50, fy: 0.50, t: "b" },
+        { fx: 0.44, fy: 0.62, t: "r" }, { fx: 0.56, fy: 0.62, t: "r" },
+      ],
+    },
+    { // 32: THE SIEGE — clear the room, but reinforcements crash in twice.
+      //   Beat every wave before the clock dies. Red rings = incoming spawns.
+      player: { fx: 0.5, fy: 0.95, ammo: 5 },
+      time: 26,   // world-seconds — enough for 3 waves if you keep moving
+      walls: [
+        { fx: 0.22, fy: 0.30, fw: 0.10, fh: 0.10 },
+        { fx: 0.68, fy: 0.30, fw: 0.10, fh: 0.10 },
+        { fx: 0.44, fy: 0.18, fw: 0.12, fh: 0.10 },
+        { fx: 0.30, fy: 0.60, fw: 0.10, fh: 0.09 },
+        { fx: 0.60, fy: 0.60, fw: 0.10, fh: 0.09 },
+      ],
+      enemies: [   // opening force
+        { fx: 0.14, fy: 0.13, t: "x" }, { fx: 0.86, fy: 0.13, t: "X" },
+        { fx: 0.34, fy: 0.12, t: "g" }, { fx: 0.66, fy: 0.12, t: "G" },
+        { fx: 0.50, fy: 0.30, t: "m" },
+        { fx: 0.20, fy: 0.42, t: "s" }, { fx: 0.80, fy: 0.42, t: "S" },
+        { fx: 0.30, fy: 0.54, t: "b" }, { fx: 0.70, fy: 0.54, t: "r" },
+      ],
+      waves: [
+        { at: 6, enemies: [   // first reinforcement — flankers from the edges
+          { fx: 0.06, fy: 0.20, t: "G" }, { fx: 0.94, fy: 0.20, t: "G" },
+          { fx: 0.50, fy: 0.12, t: "D" },
+          { fx: 0.12, fy: 0.50, t: "r" }, { fx: 0.88, fy: 0.50, t: "r" },
+        ]},
+        { at: 13, enemies: [ // second reinforcement — the heavy answer
+          { fx: 0.20, fy: 0.12, t: "X" }, { fx: 0.80, fy: 0.12, t: "X" },
+          { fx: 0.50, fy: 0.20, t: "m" },
+          { fx: 0.16, fy: 0.58, t: "b" }, { fx: 0.84, fy: 0.58, t: "b" },
+          { fx: 0.50, fy: 0.42, t: "D" },
+        ]},
+      ],
+    },
+    { // 33: THE ONSLAUGHT — the siege, scaled up. ~31 enemies across 3 waves.
+      player: { fx: 0.5, fy: 0.95, ammo: 6 },
+      time: 34,   // world-seconds — three waves' worth if you keep flowing
+      walls: [
+        { fx: 0.20, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.70, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.44, fy: 0.16, fw: 0.12, fh: 0.10 },
+        { fx: 0.30, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.62, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.16, fy: 0.64, fw: 0.10, fh: 0.08 },
+        { fx: 0.74, fy: 0.64, fw: 0.10, fh: 0.08 },
+      ],
+      enemies: [   // opening force (10)
+        { fx: 0.12, fy: 0.12, t: "x" }, { fx: 0.88, fy: 0.12, t: "X" },
+        { fx: 0.30, fy: 0.11, t: "g" }, { fx: 0.70, fy: 0.11, t: "G" },
+        { fx: 0.50, fy: 0.28, t: "m" },
+        { fx: 0.18, fy: 0.40, t: "s" }, { fx: 0.82, fy: 0.40, t: "S" },
+        { fx: 0.40, fy: 0.22, t: "d" }, { fx: 0.60, fy: 0.22, t: "D" },
+        { fx: 0.50, fy: 0.52, t: "b" },
+      ],
+      waves: [
+        { at: 6, enemies: [   // wave 1 — flankers (6)
+          { fx: 0.06, fy: 0.22, t: "G" }, { fx: 0.94, fy: 0.22, t: "G" },
+          { fx: 0.12, fy: 0.50, t: "r" }, { fx: 0.88, fy: 0.50, t: "r" },
+          { fx: 0.50, fy: 0.12, t: "D" }, { fx: 0.50, fy: 0.34, t: "X" },
+        ]},
+        { at: 12, enemies: [  // wave 2 — the heavy answer (7)
+          { fx: 0.16, fy: 0.12, t: "X" }, { fx: 0.84, fy: 0.12, t: "X" },
+          { fx: 0.30, fy: 0.14, t: "m" }, { fx: 0.70, fy: 0.14, t: "m" },
+          { fx: 0.14, fy: 0.58, t: "b" }, { fx: 0.86, fy: 0.58, t: "b" },
+          { fx: 0.50, fy: 0.32, t: "S" },
+        ]},
+        { at: 18, enemies: [  // wave 3 — the crush (8)
+          { fx: 0.10, fy: 0.12, t: "x" }, { fx: 0.90, fy: 0.12, t: "x" },
+          { fx: 0.30, fy: 0.14, t: "D" }, { fx: 0.70, fy: 0.14, t: "D" },
+          { fx: 0.50, fy: 0.10, t: "m" }, { fx: 0.50, fy: 0.40, t: "b" },
+          { fx: 0.40, fy: 0.60, t: "r" }, { fx: 0.60, fy: 0.60, t: "r" },
+        ]},
+      ],
+    },
+  ];
+
+  // ---- Game state ----
+  const STATE = { PLAYING: 0, CLEARED: 1, DEAD: 2, WON: 3, SELECT: 4 };
+  let state = STATE.SELECT;   // boot into the level-select screen
+  let levelIndex = 0;
+  let stateTimer = 0;         // real-time countdown for transitions
+  // Optional survival clock. Counts down in WORLD time (only while you move),
+  // so it starts and flows with the SUPERHOT time mechanic. 0 = no limit.
+  let levelTimeLimit = 0;
+  let levelTimeLeft = 0;
+  // Reinforcement waves: extra enemies that spawn at world-time marks.
+  let levelElapsed = 0;       // world-seconds since the level started
+  let pendingWaves = [];      // [{ at, enemies:[def], telegraphed }]
+  const spawnFx = [];         // telegraph rings: { x, y, t }  (t counts up to 1)
+  const SPAWN_TELEGRAPH = 0.7; // world-seconds of warning before a wave lands
+
+  const TYPE_MAP = { g: "gunner", s: "shotgun", x: "sniper", d: "dodger",
+                     m: "bomber", r: "rusher", b: "brute" };
+
+  function loadLevel(i) {
+    levelIndex = i;
+    const L = LEVELS[i];
+    bullets.length = 0;
+    pickups.length = 0;
+    shards.length = 0;
+    thrown.length = 0;
+    grenades.length = 0;
+    blasts.length = 0;
+    obstacles = (L.walls || []).map(w => ({
+      x: room.x + room.w * w.fx, y: room.y + room.h * w.fy,
+      w: room.w * w.fw,          h: room.h * w.fh,
+    }));
+    enemies = L.enemies.map(makeEnemyFromDef);
+    restaggerBombers();
+    // Reinforcement waves (if any): stored, spawned later at their world-time.
+    levelElapsed = 0;
+    pendingWaves = (L.waves || []).map(w => ({ at: w.at, enemies: w.enemies, telegraphed: false }));
+    spawnFx.length = 0;
+    player.x = room.x + room.w * L.player.fx;
+    player.y = room.y + room.h * L.player.fy;
+    player.vx = player.vy = 0;
+    player.ammo = L.player.ammo || 0;
+    player.hasGun = player.ammo > 0;   // start armed only if the level grants ammo
+    levelTimeLimit = L.time || 0;
+    levelTimeLeft = levelTimeLimit;
+    timeScale = 0;
+    hitFlash = 0;
+    meleeSwing = 0;
+    state = STATE.PLAYING;
+  }
+
+  function restartLevel() { loadLevel(levelIndex); }
+
+  function onPlayerDeath() {
+    if (state !== STATE.PLAYING) return;
+    state = STATE.DEAD;
+    stateTimer = 0.45;   // brief beat before instant restart (< 1s)
+    hitFlash = 1;
+  }
+
+  function onLevelClear() {
+    if (levelIndex + 1 >= LEVELS.length) {
+      state = STATE.WON;
+      stateTimer = 0;
+    } else {
+      state = STATE.CLEARED;
+      stateTimer = 0.7;
+    }
+  }
+
+  // ---- Time scaling ----
+  // timeScale is driven by how fast the player is actually moving,
+  // normalized against their max speed. Standing still => ~frozen.
+  let timeScale = 0;
+  const TIME_FLOOR = 0.07;    // never fully zero, keeps things feeling alive
+  const TIME_SMOOTH = 14;     // higher = snappier response to movement
+
+  function computeTargetTimeScale() {
+    const spd = Math.hypot(player.vx, player.vy);
+    const norm = Math.min(1, spd / player.speed);
+    return TIME_FLOOR + (1 - TIME_FLOOR) * norm;
+  }
+
+  // ---- Helpers ----
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  // ---- Update ----
+  function update(dt) {
+    // --- State transitions ---
+    if (state === STATE.SELECT) return;   // menu is static; nothing to simulate
+    if (state === STATE.CLEARED) {
+      stateTimer -= dt;
+      if (stateTimer <= 0) loadLevel(levelIndex + 1);
+      if (hitFlash > 0) hitFlash = Math.max(0, hitFlash - dt * 2.5);
+      return;
+    }
+    if (state === STATE.DEAD) {
+      stateTimer -= dt;
+      if (hitFlash > 0) hitFlash = Math.max(0, hitFlash - dt * 2.0);
+      if (stateTimer <= 0) restartLevel();
+      return;
+    }
+    if (state === STATE.WON) {
+      if (hitFlash > 0) hitFlash = Math.max(0, hitFlash - dt * 2.5);
+      return;
+    }
+
+    // --- Player movement (real time, always full speed) ---
+    let ix = 0, iy = 0;
+    if (keys["a"] || keys["arrowleft"])  ix -= 1;
+    if (keys["d"] || keys["arrowright"]) ix += 1;
+    if (keys["w"] || keys["arrowup"])    iy -= 1;
+    if (keys["s"] || keys["arrowdown"])  iy += 1;
+
+    if (ix !== 0 || iy !== 0) {
+      const len = Math.hypot(ix, iy);
+      ix /= len; iy /= len;
+    }
+    player.vx = ix * player.speed;
+    player.vy = iy * player.speed;
+
+    player.x += player.vx * dt;
+    player.y += player.vy * dt;
+
+    // slide off interior walls, then keep inside room
+    resolveCircleObstacles(player, player.r);
+    player.x = clamp(player.x, room.x + player.r, room.x + room.w - player.r);
+    player.y = clamp(player.y, room.y + player.r, room.y + room.h - player.r);
+
+    // --- Time scale: ease toward target ---
+    const target = computeTargetTimeScale();
+    timeScale += (target - timeScale) * clamp(TIME_SMOOTH * dt, 0, 1);
+
+    // melee swing anim decays in real time (it's a player action)
+    if (meleeSwing > 0) meleeSwing = Math.max(0, meleeSwing - dt);
+
+    // --- Time-scaled world updates ---
+    const tdt = dt * timeScale;
+
+    // Enemies: chargers rush + kill on contact; shooters fire on line-of-sight.
+    for (const en of enemies) {
+      if (!en.alive) continue;
+      const wantAim = Math.atan2(player.y - en.y, player.x - en.x);
+      en.aim = angLerp(en.aim, wantAim, clamp(6 * tdt, 0, 1));
+
+      if (isCharger(en)) {
+        en.x += Math.cos(en.aim) * en.speed * tdt;
+        en.y += Math.sin(en.aim) * en.speed * tdt;
+        resolveCircleObstacles(en, en.r);   // chargers slide off walls too
+        en.x = clamp(en.x, room.x + en.r, room.x + room.w - en.r);
+        en.y = clamp(en.y, room.y + en.r, room.y + room.h - en.r);
+        if (Math.hypot(en.x - player.x, en.y - player.y) <= en.r + player.r) {
+          onPlayerDeath();
+        }
+      } else if (en.type === "bomber") {
+        // Lob a grenade to where the player is HEADING — ignores walls.
+        en.timer -= tdt;
+        if (en.timer <= 0) {
+          en.timer = en.cooldown;
+          // aim point: lead along the player's heading...
+          const spd = Math.hypot(player.vx, player.vy);
+          let tx = player.x, ty = player.y;
+          if (spd > 5) { tx += (player.vx / spd) * BOMB_LEAD; ty += (player.vy / spd) * BOMB_LEAD; }
+          // ...then scatter — its shape scales with how badly you need ammo.
+          const af = clamp(player.ammo / BOMB_AMMO_REF, 0, 1);   // 0=empty .. 1=stocked
+          const weaponBias = BOMB_WEAPON_BIAS * (1 - af);  // fades out as you stock up
+          const scatter = BOMB_SCATTER_MIN + (BOMB_SCATTER_MAX - BOMB_SCATTER_MIN) * (1 - af);
+          const sr = Math.random() * scatter;
+          // only lean toward a gun when the pull is meaningful (low ammo)
+          const gun = weaponBias > 1 ? nearestPickup(player.x, player.y) : null;
+          let ox, oy;
+          if (gun) {
+            let wx = gun.x - tx, wy = gun.y - ty;
+            const wd = Math.hypot(wx, wy) || 1;
+            wx /= wd; wy /= wd;
+            const along = weaponBias + sr;                 // bounded lean toward the weapon
+            const perp = (Math.random() - 0.5) * scatter;  // sideways jitter
+            ox = wx * along - wy * perp;
+            oy = wy * along + wx * perp;
+          } else {
+            const sa = Math.random() * Math.PI * 2;        // stocked up: tight scatter on you
+            ox = Math.cos(sa) * sr; oy = Math.sin(sa) * sr;
+          }
+          tx = clamp(tx + ox, room.x + 12, room.x + room.w - 12);
+          ty = clamp(ty + oy, room.y + 12, room.y + room.h - 12);
+          const a = Math.atan2(ty - en.y, tx - en.x);
+          grenades.push({
+            x: en.x + Math.cos(a) * (en.r + 6),
+            y: en.y + Math.sin(a) * (en.r + 6),
+            tx, ty,
+            vx: Math.cos(a) * GRENADE_SPEED,
+            vy: Math.sin(a) * GRENADE_SPEED,
+          });
+        }
+      } else {
+        // Mobile shooter: hold position and fire when it has a clean line on
+        // you. Only when its shot is BLOCKED does it move — repositioning to
+        // flank your cover and reopen an angle. (No aimless kiting.)
+        if (en.mobile && lineBlocked(en.x, en.y, player.x, player.y)) {
+          const dir = seekAngleDir(en);
+          if (dir) {
+            en.x += dir.x * en.moveSpeed * tdt;
+            en.y += dir.y * en.moveSpeed * tdt;
+          }
+        }
+        // Dodger: strafe out of the path of an incoming shot/throw.
+        if (en.type === "dodger") {
+          const dir = incomingDodgeDir(en);
+          if (dir) {
+            en.x += dir.x * en.dodgeSpeed * tdt;
+            en.y += dir.y * en.dodgeSpeed * tdt;
+          }
+        }
+        // resolve movement against walls / room bounds (mobile or dodging)
+        if (en.mobile || en.type === "dodger") {
+          resolveCircleObstacles(en, en.r);
+          en.x = clamp(en.x, room.x + en.r, room.x + room.w - en.r);
+          en.y = clamp(en.y, room.y + en.r, room.y + room.h - en.r);
+        }
+        en.timer -= tdt;
+        // only fire with a clear line to the player (walls are real cover)
+        const canSee = !lineBlocked(en.x, en.y, player.x, player.y);
+        if (en.timer <= 0 && canSee) {
+          en.timer = en.cooldown;
+          const muzzle = en.r + 8;
+          const half = (en.pellets - 1) / 2;
+          for (let p = 0; p < en.pellets; p++) {
+            const a = en.aim + (p - half) * en.spread;
+            const bx = en.x + Math.cos(a) * muzzle;
+            const by = en.y + Math.sin(a) * muzzle;
+            bullets.push({
+              x: bx, y: by, px: bx, py: by,
+              vx: Math.cos(a) * en.bulletSpeed,
+              vy: Math.sin(a) * en.bulletSpeed,
+              life: 6,
+              owner: "enemy",
+            });
+          }
+        } else if (en.timer <= 0) {
+          en.timer = 0.15;   // no LOS: re-check again shortly
+        }
+      }
+    }
+
+    // Grenades in flight -> land at target, then start a fused blast.
+    for (let i = grenades.length - 1; i >= 0; i--) {
+      const g = grenades[i];
+      const step = GRENADE_SPEED * tdt;
+      const dToTarget = Math.hypot(g.tx - g.x, g.ty - g.y);
+      if (dToTarget <= step || dToTarget < 4) {
+        blasts.push({ x: g.tx, y: g.ty, fuse: BLAST_FUSE, r: BLAST_R, boom: 0 });
+        grenades.splice(i, 1);
+        continue;
+      }
+      g.x += g.vx * tdt;
+      g.y += g.vy * tdt;
+    }
+
+    // Blasts: count down the fuse (time-scaled), then detonate.
+    for (let i = blasts.length - 1; i >= 0; i--) {
+      const bl = blasts[i];
+      if (bl.boom > 0) {                 // detonation flash plays in real time
+        bl.boom -= dt * 2.2;
+        if (bl.boom <= 0) blasts.splice(i, 1);
+        continue;
+      }
+      bl.fuse -= tdt;
+      if (bl.fuse <= 0) {
+        bl.boom = 1;                     // trigger the flash
+        if (Math.hypot(player.x - bl.x, player.y - bl.y) <= bl.r + player.r) {
+          onPlayerDeath();
+        }
+      }
+    }
+
+    // Advance bullets (time-scaled). Track previous pos for swept collision.
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      b.px = b.x; b.py = b.y;
+      b.x += b.vx * tdt;
+      b.y += b.vy * tdt;
+      b.life -= tdt;
+
+      // room bounds / lifetime -> despawn
+      if (b.life <= 0 ||
+          b.x < room.x || b.x > room.x + room.w ||
+          b.y < room.y || b.y > room.y + room.h) {
+        bullets.splice(i, 1);
+        continue;
+      }
+      // interior wall -> despawn (bullets don't pass through cover)
+      if (lineBlocked(b.px, b.py, b.x, b.y)) {
+        bullets.splice(i, 1);
+        continue;
+      }
+
+      if (b.owner === "enemy") {
+        // swept collision vs player (segment px,py -> x,y within player radius)
+        if (segCircleHit(b.px, b.py, b.x, b.y, player.x, player.y, player.r + BULLET_R)) {
+          bullets.splice(i, 1);
+          onPlayerDeath();
+        }
+      } else {
+        // player bullet -> kill first enemy it sweeps through
+        let hit = false;
+        for (const en of enemies) {
+          if (!en.alive) continue;
+          if (segCircleHit(b.px, b.py, b.x, b.y, en.x, en.y, en.r + BULLET_R)) {
+            killEnemy(en);
+            hit = true;
+            break;
+          }
+        }
+        if (hit) bullets.splice(i, 1);
+      }
+    }
+
+    // Thrown weapons (time-scaled): kill on contact, then land as a pickup.
+    for (let i = thrown.length - 1; i >= 0; i--) {
+      const t = thrown[i];
+      t.px = t.x; t.py = t.y;
+      const step = THROW_SPEED * tdt;
+      t.x += t.vx * tdt;
+      t.y += t.vy * tdt;
+      t.dist += step;
+      t.rot += t.vrot * tdt;
+
+      // hit an enemy? one-shot it and drop where it fell
+      let killed = false;
+      for (const en of enemies) {
+        if (!en.alive) continue;
+        if (segCircleHit(t.px, t.py, t.x, t.y, en.x, en.y, en.r + t.r)) {
+          killEnemy(en);
+          landThrown(t, en.x, en.y);
+          killed = true;
+          break;
+        }
+      }
+      if (killed) { thrown.splice(i, 1); continue; }
+
+      // hit a wall -> land just before it
+      if (lineBlocked(t.px, t.py, t.x, t.y)) {
+        landThrown(t, t.px, t.py);
+        thrown.splice(i, 1);
+        continue;
+      }
+      // out of room or spent -> land here
+      if (t.dist >= THROW_MAX_DIST ||
+          t.x < room.x || t.x > room.x + room.w ||
+          t.y < room.y || t.y > room.y + room.h) {
+        landThrown(t, t.x, t.y);
+        thrown.splice(i, 1);
+      }
+    }
+
+    // Pickups: auto-grab a dropped gun by walking over it.
+    for (let i = pickups.length - 1; i >= 0; i--) {
+      const p = pickups[i];
+      if (Math.hypot(p.x - player.x, p.y - player.y) <= player.r + p.r) {
+        player.hasGun = true;   // now holding a gun (even a 0-ammo one is throwable)
+        player.ammo = Math.min(PLAYER_MAX_AMMO, player.ammo + p.ammo);
+        pickups.splice(i, 1);
+      }
+    }
+
+    // Advance shatter fragments (time-scaled — they freeze in bullet-time).
+    for (let i = shards.length - 1; i >= 0; i--) {
+      const s = shards[i];
+      s.x += s.vx * tdt;
+      s.y += s.vy * tdt;
+      s.vx *= (1 - 2.5 * tdt);   // drag
+      s.vy *= (1 - 2.5 * tdt);
+      s.rot += s.vrot * tdt;
+      s.life -= tdt;
+      if (s.life <= 0) shards.splice(i, 1);
+    }
+
+    if (hitFlash > 0) hitFlash = Math.max(0, hitFlash - dt * 2.5);
+
+    // --- Survival clock: burns down in world time (only while you move) ---
+    if (levelTimeLimit > 0 && state === STATE.PLAYING) {
+      levelTimeLeft -= tdt;
+      if (levelTimeLeft <= 0) { levelTimeLeft = 0; onPlayerDeath(); }
+    }
+
+    // --- Reinforcement waves (world-time scheduled) ---
+    if (state === STATE.PLAYING) {
+      levelElapsed += tdt;
+      for (let i = pendingWaves.length - 1; i >= 0; i--) {
+        const wv = pendingWaves[i];
+        // telegraph: pulse a ring at each spawn spot shortly before it lands
+        if (!wv.telegraphed && levelElapsed >= wv.at - SPAWN_TELEGRAPH) {
+          wv.telegraphed = true;
+          for (const e of wv.enemies) {
+            spawnFx.push({ x: room.x + room.w * e.fx, y: room.y + room.h * e.fy, t: 0 });
+          }
+        }
+        if (levelElapsed >= wv.at) {
+          for (const e of wv.enemies) enemies.push(makeEnemyFromDef(e));
+          restaggerBombers();                 // fold any new bombers into the beat
+          pendingWaves.splice(i, 1);
+        }
+      }
+    }
+    // advance telegraph rings
+    for (let i = spawnFx.length - 1; i >= 0; i--) {
+      spawnFx[i].t += tdt / SPAWN_TELEGRAPH;
+      if (spawnFx[i].t >= 1) spawnFx.splice(i, 1);
+    }
+
+    // --- Win check: room cleared AND no more reinforcements coming ---
+    if (state === STATE.PLAYING && pendingWaves.length === 0 && enemies.every(e => !e.alive)) {
+      onLevelClear();
+    }
+  }
+
+  // ---- Melee: kill enemies in a forward cone at close range ----
+  function doMelee() {
+    meleeSwing = MELEE_SWING_TIME;
+    const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+    for (const en of enemies) {
+      if (!en.alive) continue;
+      const dx = en.x - player.x, dy = en.y - player.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist > MELEE_RANGE + player.r + en.r) continue;
+      // within forward arc?
+      const toEn = Math.atan2(dy, dx);
+      let d = Math.abs(((toEn - aim + Math.PI) % (Math.PI * 2)) - Math.PI);
+      if (d <= MELEE_ARC) killEnemy(en);
+    }
+  }
+
+  // ---- Shoot: fire a player bullet (time-scaled like everything else) ----
+  function doShoot() {
+    if (player.ammo <= 0) return;
+    player.ammo--;
+    meleeSwing = 0;
+    const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+    const muzzle = player.r + 6;
+    const bx = player.x + Math.cos(aim) * muzzle;
+    const by = player.y + Math.sin(aim) * muzzle;
+    bullets.push({
+      x: bx, y: by, px: bx, py: by,
+      vx: Math.cos(aim) * BULLET_SPEED,
+      vy: Math.sin(aim) * BULLET_SPEED,
+      life: 6,
+      owner: "player",
+    });
+  }
+
+  // ---- Throw: hurl the held weapon. One-shots an enemy, then lands as a pickup. ----
+  function doThrow() {
+    if (!player.hasGun) return;     // bare-handed: nothing to throw
+    const ammo = player.ammo;       // an empty gun (ammo 0) is still a projectile
+    player.hasGun = false;          // your hands are now empty
+    player.ammo = 0;
+    meleeSwing = 0;
+    const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+    const muzzle = player.r + 8;
+    const tx = player.x + Math.cos(aim) * muzzle;
+    const ty = player.y + Math.sin(aim) * muzzle;
+    thrown.push({
+      x: tx, y: ty, px: tx, py: ty,
+      vx: Math.cos(aim) * THROW_SPEED,
+      vy: Math.sin(aim) * THROW_SPEED,
+      ammo, rot: aim, vrot: 16, dist: 0, r: THROW_R,
+    });
+  }
+
+  // Thrown weapon comes to rest -> drop it as a retrievable pickup.
+  function landThrown(t, x, y) {
+    pickups.push({
+      x: clamp(x, room.x + PICKUP_R, room.x + room.w - PICKUP_R),
+      y: clamp(y, room.y + PICKUP_R, room.y + room.h - PICKUP_R),
+      ammo: t.ammo, r: PICKUP_R,
+    });
+  }
+
+  const DROP_AMMO = { gunner: 2, shotgun: 3, sniper: 2, dodger: 2 };
+  function killEnemy(en) {
+    en.alive = false;
+    spawnShatter(en.x, en.y);
+    // armed enemies drop their weapon; chargers carry nothing
+    const ammo = DROP_AMMO[en.type];
+    if (ammo) pickups.push({ x: en.x, y: en.y, ammo, r: PICKUP_R });
+  }
+
+  function spawnShatter(x, y) {
+    const n = 7 + (Math.random() * 3 | 0);
+    for (let i = 0; i < n; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const spd = 90 + Math.random() * 160;
+      shards.push({
+        x, y,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        rot: Math.random() * Math.PI * 2,
+        vrot: (Math.random() - 0.5) * 10,
+        size: 5 + Math.random() * 7,
+        life: 0.7 + Math.random() * 0.5,
+        maxLife: 1.2,
+      });
+    }
+  }
+
+  // shortest-path angle lerp
+  function angLerp(a, b, t) {
+    let d = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI;
+    if (d < -Math.PI) d += Math.PI * 2;
+    return a + d * t;
+  }
+
+  // distance from point (cx,cy) to segment (x1,y1)-(x2,y2) <= rad ?
+  function segCircleHit(x1, y1, x2, y2, cx, cy, rad) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    let t = len2 > 0 ? ((cx - x1) * dx + (cy - y1) * dy) / len2 : 0;
+    t = clamp(t, 0, 1);
+    const nx = x1 + dx * t, ny = y1 + dy * t;
+    return Math.hypot(cx - nx, cy - ny) <= rad;
+  }
+
+  // ---- Wall (AABB) helpers ----
+  // Push a circle (obj.x/obj.y, radius r) out of every obstacle. Resolving
+  // along the smallest-penetration axis gives natural wall-sliding.
+  function resolveCircleObstacles(obj, r) {
+    for (const o of obstacles) {
+      const nx = clamp(obj.x, o.x, o.x + o.w);
+      const ny = clamp(obj.y, o.y, o.y + o.h);
+      const dx = obj.x - nx, dy = obj.y - ny;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < r * r) {
+        if (d2 > 0.0001) {
+          const d = Math.sqrt(d2);
+          obj.x = nx + (dx / d) * r;
+          obj.y = ny + (dy / d) * r;
+        } else {
+          // center inside the rect -> eject along nearest edge
+          const left = obj.x - o.x, right = o.x + o.w - obj.x;
+          const top = obj.y - o.y, bot = o.y + o.h - obj.y;
+          const m = Math.min(left, right, top, bot);
+          if (m === left)  obj.x = o.x - r;
+          else if (m === right) obj.x = o.x + o.w + r;
+          else if (m === top)   obj.y = o.y - r;
+          else obj.y = o.y + o.h + r;
+        }
+      }
+    }
+  }
+
+  // Segment vs AABB (Liang–Barsky). True if they intersect.
+  function segAABB(x1, y1, x2, y2, o) {
+    let t0 = 0, t1 = 1;
+    const dx = x2 - x1, dy = y2 - y1;
+    const p = [-dx, dx, -dy, dy];
+    const q = [x1 - o.x, o.x + o.w - x1, y1 - o.y, o.y + o.h - y1];
+    for (let i = 0; i < 4; i++) {
+      if (p[i] === 0) { if (q[i] < 0) return false; }
+      else {
+        const t = q[i] / p[i];
+        if (p[i] < 0) { if (t > t1) return false; if (t > t0) t0 = t; }
+        else          { if (t < t0) return false; if (t < t1) t1 = t; }
+      }
+    }
+    return true;
+  }
+
+  // Is the straight line between two points blocked by any wall?
+  function lineBlocked(x1, y1, x2, y2) {
+    for (const o of obstacles) if (segAABB(x1, y1, x2, y2, o)) return true;
+    return false;
+  }
+
+  // Dodger AI: if a player bullet/thrown weapon is on a near-collision course,
+  // return a unit direction perpendicular to it (away from its line) to strafe.
+  const DODGE_REACT = 215;    // how far out it starts reacting
+  function incomingDodgeDir(en) {
+    let best = null, bestDist = DODGE_REACT;
+    const consider = (th) => {
+      const pdx = en.x - th.x, pdy = en.y - th.y;
+      const dist = Math.hypot(pdx, pdy);
+      if (dist > DODGE_REACT || dist < 1) return;
+      const sp = Math.hypot(th.vx, th.vy) || 1;
+      const towardsCos = (th.vx * pdx + th.vy * pdy) / (sp * dist);
+      if (towardsCos < 0.9) return;                 // not heading at us
+      const cross = (th.vx * pdy - th.vy * pdx) / sp; // signed lateral offset
+      if (Math.abs(cross) > en.r + 24) return;      // it would miss anyway
+      if (dist < bestDist) { bestDist = dist; best = { sp, vx: th.vx, vy: th.vy, cross }; }
+    };
+    for (const b of bullets) if (b.owner === "player") consider(b);
+    for (const t of thrown) consider(t);
+    if (!best) return null;
+    const ux = best.vx / best.sp, uy = best.vy / best.sp;
+    // perpendicular, pushed to the side the dodger is already leaning toward
+    return best.cross >= 0 ? { x: -uy, y: ux } : { x: uy, y: -ux };
+  }
+
+  // Nearest dropped weapon to a point (used to bias bomber aim toward resupply).
+  function nearestPickup(x, y) {
+    let best = null, bestD = Infinity;
+    for (const p of pickups) {
+      const d = (p.x - x) ** 2 + (p.y - y) ** 2;
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    return best;
+  }
+
+  // Does a circle at (x,y,r) overlap any wall?
+  function circleHitsObstacle(x, y, r) {
+    for (const o of obstacles) {
+      const nx = clamp(x, o.x, o.x + o.w);
+      const ny = clamp(y, o.y, o.y + o.h);
+      if ((x - nx) ** 2 + (y - ny) ** 2 < r * r) return true;
+    }
+    return false;
+  }
+
+  // Mobile-shooter brain: sample directions and pick the step that best opens
+  // a clean line to the player (flank the cover), preferring to also close in.
+  const SEEK_LOOKAHEAD = 46;
+  function seekAngleDir(en) {
+    let best = null, bestScore = -Infinity;
+    for (let k = 0; k < 12; k++) {
+      const a = (k / 12) * Math.PI * 2;
+      const nx = en.x + Math.cos(a) * SEEK_LOOKAHEAD;
+      const ny = en.y + Math.sin(a) * SEEK_LOOKAHEAD;
+      if (nx < room.x + en.r || nx > room.x + room.w - en.r ||
+          ny < room.y + en.r || ny > room.y + room.h - en.r) continue;
+      if (circleHitsObstacle(nx, ny, en.r)) continue;
+      const los = !lineBlocked(nx, ny, player.x, player.y);
+      const dist = Math.hypot(player.x - nx, player.y - ny);
+      // strongly prefer a spot with line-of-sight, then one that's closer
+      const score = (los ? 1000 : 0) - dist * 0.4;
+      if (score > bestScore) { bestScore = score; best = { x: Math.cos(a), y: Math.sin(a) }; }
+    }
+    return best;
+  }
+
+  // ---- Draw ----
+  function drawRoom() {
+    // floor
+    ctx.fillStyle = COL.floor;
+    ctx.fillRect(0, 0, W, H);
+    // wall border (thick frame)
+    ctx.fillStyle = COL.wall;
+    ctx.fillRect(0, 0, W, room.y);                       // top
+    ctx.fillRect(0, room.y + room.h, W, H - (room.y+room.h)); // bottom
+    ctx.fillRect(0, 0, room.x, H);                       // left
+    ctx.fillRect(room.x + room.w, 0, W - (room.x+room.w), H); // right
+    // inner edge line
+    ctx.strokeStyle = COL.wallEdge;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(room.x, room.y, room.w, room.h);
+
+    // interior cover walls
+    for (const o of obstacles) {
+      ctx.fillStyle = COL.wall;
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+      ctx.strokeStyle = COL.wallEdge;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(o.x, o.y, o.w, o.h);
+    }
+  }
+
+  function drawHumanoid(x, y, r, aim, bodyColor, darkColor) {
+    // body
+    ctx.fillStyle = bodyColor;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    // shoulders / a slight capsule feel
+    ctx.fillStyle = darkColor;
+    ctx.beginPath();
+    ctx.arc(x, y, r * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+    // aim arm
+    ctx.strokeStyle = bodyColor;
+    ctx.lineWidth = 5;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + Math.cos(aim) * (r + 10), y + Math.sin(aim) * (r + 10));
+    ctx.stroke();
+  }
+
+  function drawPlayer() {
+    const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+    // aim guide line (thin)
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 6]);
+    ctx.beginPath();
+    ctx.moveTo(player.x, player.y);
+    ctx.lineTo(player.x + Math.cos(aim) * 500, player.y + Math.sin(aim) * 500);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // melee swing arc (a quick sweep in front of the player)
+    if (meleeSwing > 0) {
+      const prog = 1 - meleeSwing / MELEE_SWING_TIME;   // 0..1
+      const reach = player.r + MELEE_RANGE;
+      const sweep = MELEE_ARC * 2;
+      const a0 = aim - MELEE_ARC + sweep * prog * 0.6;
+      ctx.strokeStyle = "rgba(17,17,17,0.55)";
+      ctx.lineWidth = 4;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.arc(player.x, player.y, reach, a0 - 0.35, a0 + 0.35);
+      ctx.stroke();
+    }
+
+    drawHumanoid(player.x, player.y, player.r, aim, COL.player, "#333");
+  }
+
+  function drawEnemies() {
+    for (const en of enemies) {
+      if (!en.alive) continue;
+      if (isCharger(en)) {
+        // unarmed charger: body + a forward-pointing wedge (no gun arm)
+        ctx.fillStyle = COL.enemy;
+        ctx.beginPath();
+        ctx.arc(en.x, en.y, en.r, 0, Math.PI * 2);
+        ctx.fill();
+        // brutes get a heavy dark ring to read as "strong"
+        if (en.type === "brute") {
+          ctx.strokeStyle = COL.enemyDk;
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.arc(en.x, en.y, en.r - 2, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.fillStyle = COL.enemyDk;
+        ctx.save();
+        ctx.translate(en.x, en.y);
+        ctx.rotate(en.aim);
+        ctx.beginPath();
+        ctx.moveTo(en.r + 6, 0);
+        ctx.lineTo(-2, -en.r * 0.6);
+        ctx.lineTo(-2, en.r * 0.6);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      } else if (en.type === "bomber") {
+        // round body, no gun arm, with a pulsing fuse dot on top
+        ctx.fillStyle = COL.enemy;
+        ctx.beginPath();
+        ctx.arc(en.x, en.y, en.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = COL.enemyDk;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(en.x, en.y, en.r - 3, 0, Math.PI * 2);
+        ctx.stroke();
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 160);
+        ctx.fillStyle = "#111";
+        ctx.beginPath();
+        ctx.arc(en.x, en.y - en.r - 3, 2.5 + pulse * 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        // mobile shooter: a dashed dark halo to read as "this one advances"
+        if (en.mobile) {
+          ctx.strokeStyle = COL.enemyDk;
+          ctx.lineWidth = 2;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.arc(en.x, en.y, en.r + 5, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        drawHumanoid(en.x, en.y, en.r, en.aim, COL.enemy, COL.enemyDk);
+        // dodger: a white inner ring to read as "quick / evasive"
+        if (en.type === "dodger") {
+          ctx.strokeStyle = "#f3f3f3";
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.arc(en.x, en.y, en.r * 0.5, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        // shotgunner: a forked twin-barrel muzzle to telegraph the spread
+        if (en.type === "shotgun") {
+          ctx.strokeStyle = COL.enemy;
+          ctx.lineWidth = 4;
+          ctx.lineCap = "round";
+          for (const s of [-0.30, 0.30]) {
+            ctx.beginPath();
+            ctx.moveTo(en.x, en.y);
+            ctx.lineTo(en.x + Math.cos(en.aim + s) * (en.r + 12),
+                       en.y + Math.sin(en.aim + s) * (en.r + 12));
+            ctx.stroke();
+          }
+        }
+        // sniper: a long thin barrel + a faint laser sightline
+        if (en.type === "sniper") {
+          ctx.strokeStyle = COL.enemyDk;
+          ctx.lineWidth = 3;
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.moveTo(en.x, en.y);
+          ctx.lineTo(en.x + Math.cos(en.aim) * (en.r + 20),
+                     en.y + Math.sin(en.aim) * (en.r + 20));
+          ctx.stroke();
+          if (!lineBlocked(en.x, en.y, player.x, player.y)) {
+            ctx.strokeStyle = "rgba(230,48,40,0.20)";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(en.x, en.y);
+            ctx.lineTo(player.x, player.y);
+            ctx.stroke();
+          }
+        }
+      }
+    }
+  }
+
+  function drawPickups() {
+    for (const p of pickups) {
+      // a small dark "gun" chip on the floor
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.fillStyle = "rgba(17,17,17,0.85)";
+      ctx.fillRect(-p.r * 0.75, -p.r * 0.4, p.r * 1.5, p.r * 0.8);
+      ctx.fillRect(p.r * 0.1, -p.r * 0.1, p.r * 0.5, p.r * 0.9);
+      // subtle pulse ring so it reads as grabbable
+      ctx.strokeStyle = "rgba(17,17,17,0.25)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(0, 0, p.r + 4 + Math.sin(performance.now() / 300) * 2, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawThrown() {
+    for (const t of thrown) {
+      // motion-blur streak behind it (world space)
+      const sp = Math.hypot(t.vx, t.vy) || 1;
+      ctx.strokeStyle = "rgba(17,17,17,0.28)";
+      ctx.lineWidth = 3;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(t.x - (t.vx / sp) * 24, t.y - (t.vy / sp) * 24);
+      ctx.lineTo(t.x, t.y);
+      ctx.stroke();
+      // the spinning gun
+      ctx.save();
+      ctx.translate(t.x, t.y);
+      ctx.rotate(t.rot);
+      ctx.fillStyle = "#111";
+      ctx.fillRect(-t.r * 0.75, -t.r * 0.4, t.r * 1.5, t.r * 0.8);
+      ctx.fillRect(t.r * 0.1, -t.r * 0.1, t.r * 0.5, t.r * 0.9);
+      ctx.restore();
+    }
+  }
+
+  function drawGrenades() {
+    for (const g of grenades) {
+      ctx.fillStyle = "#111";
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      // blinking red core so it reads as live ordnance
+      const blink = 0.5 + 0.5 * Math.sin(performance.now() / 80);
+      ctx.fillStyle = "rgba(230,48,40," + (0.4 + blink * 0.6).toFixed(2) + ")";
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, 2.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawBlasts() {
+    for (const bl of blasts) {
+      if (bl.boom > 0) {
+        // detonation flash: bright expanding ring
+        const grow = 1 + (1 - bl.boom) * 0.35;
+        ctx.fillStyle = "rgba(230,48,40," + (0.45 * bl.boom).toFixed(3) + ")";
+        ctx.beginPath();
+        ctx.arc(bl.x, bl.y, bl.r * grow, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "rgba(230,48,40," + (0.8 * bl.boom).toFixed(3) + ")";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(bl.x, bl.y, bl.r * grow, 0, Math.PI * 2);
+        ctx.stroke();
+      } else {
+        // pending: danger zone outline + a shrinking fill that tracks the fuse
+        const f = clamp(bl.fuse / BLAST_FUSE, 0, 1);   // 1 -> 0
+        ctx.fillStyle = "rgba(230,48,40,0.12)";
+        ctx.beginPath();
+        ctx.arc(bl.x, bl.y, bl.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = "rgba(230,48,40,0.7)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(bl.x, bl.y, bl.r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // inner ring collapses toward center as the fuse burns down
+        ctx.strokeStyle = "rgba(230,48,40,0.85)";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(bl.x, bl.y, bl.r * (1 - f), 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function drawShards() {
+    for (const s of shards) {
+      const a = clamp(s.life / s.maxLife, 0, 1);
+      ctx.save();
+      ctx.translate(s.x, s.y);
+      ctx.rotate(s.rot);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = COL.enemy;
+      ctx.beginPath();
+      ctx.moveTo(0, -s.size);
+      ctx.lineTo(s.size * 0.9, s.size * 0.7);
+      ctx.lineTo(-s.size * 0.9, s.size * 0.7);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawBullets() {
+    for (const b of bullets) {
+      // black trail: a short line behind the bullet along its velocity
+      const tlen = 18;
+      const sp = Math.hypot(b.vx, b.vy) || 1;
+      const ux = b.vx / sp, uy = b.vy / sp;
+      ctx.strokeStyle = COL.trail;
+      ctx.lineWidth = 3;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(b.x - ux * tlen, b.y - uy * tlen);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+      // bullet head
+      ctx.fillStyle = COL.trail;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, BULLET_R, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawHitFlash() {
+    if (hitFlash <= 0) return;
+    ctx.fillStyle = "rgba(230,48,40," + (0.5 * hitFlash).toFixed(3) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawTimeMeter() {
+    // top-left thin bar showing current time flow
+    const bw = 160, bh = 8, bx = room.x + 8, by = room.y + 8;
+    ctx.fillStyle = "rgba(0,0,0,0.08)";
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = COL.accent;
+    ctx.fillRect(bx, by, bw * timeScale, bh);
+    ctx.fillStyle = "#555";
+    ctx.font = "11px Helvetica Neue, Arial";
+    ctx.textBaseline = "top";
+    ctx.fillText("TIME", bx, by + 12);
+  }
+
+  function drawSpawnFx() {
+    for (const s of spawnFx) {
+      const p = clamp(s.t, 0, 1);
+      // a ring that shrinks inward toward the spawn point as the timer fills
+      ctx.strokeStyle = "rgba(230,48,40," + (0.35 + 0.5 * p).toFixed(2) + ")";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 30 * (1 - p) + 14, 0, Math.PI * 2);
+      ctx.stroke();
+      // a small red core that grows in — "something is materializing here"
+      ctx.fillStyle = "rgba(230,48,40," + (0.25 * p).toFixed(2) + ")";
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 13 * p, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function draw() {
+    drawRoom();
+    drawBlasts();       // danger zones on the floor, under everything
+    drawSpawnFx();      // incoming-reinforcement telegraphs
+    drawPickups();
+    drawEnemies();
+    drawShards();
+    drawThrown();
+    drawGrenades();
+    drawBullets();
+    drawPlayer();
+    drawTimeMeter();
+    drawAmmo();
+    drawLevelLabel();
+    drawSurvivalClock();
+    drawHitFlash();
+    drawOverlays();
+  }
+
+  function drawSurvivalClock() {
+    if (levelTimeLimit <= 0 || state === STATE.SELECT) return;
+    const low = levelTimeLeft <= 5;
+    ctx.fillStyle = low ? COL.enemy : "#333";
+    ctx.font = "bold 22px Helvetica Neue, Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(levelTimeLeft.toFixed(1) + "s", W / 2, room.y + 8);
+    ctx.font = "10px Helvetica Neue, Arial";
+    ctx.fillStyle = "#888";
+    ctx.fillText("TIME LEFT", W / 2, room.y + 32);
+    ctx.textAlign = "left";
+  }
+
+  function drawLevelLabel() {
+    ctx.fillStyle = "#555";
+    ctx.font = "bold 13px Helvetica Neue, Arial";
+    ctx.textBaseline = "bottom";
+    ctx.textAlign = "left";
+    ctx.fillText("LEVEL " + (levelIndex + 1) + " / " + LEVELS.length,
+                 room.x + 8, room.y + room.h - 8);
+  }
+
+  function drawOverlays() {
+    if (state === STATE.CLEARED) {
+      centerText("LEVEL CLEARED", 34, "#111");
+    } else if (state === STATE.WON) {
+      ctx.fillStyle = "rgba(220,220,220,0.75)";
+      ctx.fillRect(0, 0, W, H);
+      centerText("YOU WIN", 46, "#111", -18);
+      centerText("CLICK FOR LEVEL SELECT", 18, "#555", 26);
+    } else if (state === STATE.SELECT) {
+      drawSelect();
+    }
+  }
+
+  // ---- Level select ----
+  // Grid geometry is derived once so draw + click hit-testing agree.
+  function selectCells() {
+    const cols = 7, n = LEVELS.length;
+    const cw = 96, ch = 60, gap = 14;
+    const rows = Math.ceil(n / cols);
+    const gridW = cols * cw + (cols - 1) * gap;
+    const gridH = rows * ch + (rows - 1) * gap;
+    const x0 = (W - gridW) / 2;
+    const y0 = (H - gridH) / 2 + 24;
+    const cells = [];
+    for (let i = 0; i < n; i++) {
+      const c = i % cols, r = (i / cols) | 0;
+      cells.push({ idx: i, x: x0 + c * (cw + gap), y: y0 + r * (ch + gap), w: cw, h: ch });
+    }
+    return cells;
+  }
+
+  function drawSelect() {
+    ctx.fillStyle = "#dcdcdc";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#111";
+    ctx.font = "bold 40px Helvetica Neue, Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("SUPERHOT DUPE", W / 2, 70);
+    ctx.fillStyle = "#666";
+    ctx.font = "14px Helvetica Neue, Arial";
+    ctx.fillText("SELECT A LEVEL", W / 2, 104);
+
+    for (const cell of selectCells()) {
+      const hot = mouse.x >= cell.x && mouse.x <= cell.x + cell.w &&
+                  mouse.y >= cell.y && mouse.y <= cell.y + cell.h;
+      ctx.fillStyle = hot ? "#111" : "#c4c4c4";
+      ctx.fillRect(cell.x, cell.y, cell.w, cell.h);
+      ctx.strokeStyle = "#9a9a9a";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(cell.x, cell.y, cell.w, cell.h);
+      ctx.fillStyle = hot ? "#fff" : "#222";
+      ctx.font = "bold 24px Helvetica Neue, Arial";
+      ctx.fillText(String(cell.idx + 1), cell.x + cell.w / 2, cell.y + cell.h / 2);
+    }
+
+    ctx.fillStyle = "#888";
+    ctx.font = "12px Helvetica Neue, Arial";
+    ctx.fillText("CLICK A LEVEL TO PLAY   •   PRESS ESC ANY TIME TO RETURN HERE", W / 2, H - 40);
+    ctx.textAlign = "left";
+  }
+
+  function centerText(txt, size, color, dy) {
+    ctx.fillStyle = color;
+    ctx.font = "bold " + size + "px Helvetica Neue, Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(txt, W / 2, H / 2 + (dy || 0));
+    ctx.textAlign = "left";
+  }
+
+  function drawAmmo() {
+    ctx.fillStyle = "#333";
+    ctx.font = "bold 16px Helvetica Neue, Arial";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "right";
+    const label = player.ammo > 0 ? ("AMMO " + player.ammo)
+                : player.hasGun    ? "EMPTY — THROW / PUNCH"
+                :                    "UNARMED — PUNCH";
+    ctx.fillText(label, room.x + room.w - 8, room.y + 8);
+    ctx.textAlign = "left";
+  }
+
+  // ---- Loop ----
+  let last = performance.now();
+  function frame(now) {
+    let dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.05) dt = 0.05; // clamp big hitches (tab switches)
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  // boot into the level-select screen (state = SELECT); no level loaded yet
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
