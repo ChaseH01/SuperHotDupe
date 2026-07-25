@@ -64,12 +64,16 @@
     accent:  "#111111",
   };
 
-  // ---- Room ----
-  const room = { x: 40, y: 40, w: W - 80, h: H - 80 };
+  // ---- World / camera ----
+  // room = the traversable play area (world coords). For normal levels it's
+  // one screenful; for "explore" levels it's larger and the camera scrolls.
+  let room = { x: 40, y: 40, w: W - 80, h: H - 80 };
+  const camera = { x: 0, y: 0 };   // top-left of the viewport, in world coords
 
   // ---- Input ----
   const keys = {};
-  const mouse = { x: W / 2, y: H / 2 };
+  const mouse = { x: W / 2, y: H / 2 };        // screen/canvas coords
+  const mouseWorld = { x: W / 2, y: H / 2 };   // world coords (mouse + camera)
 
   window.addEventListener("keydown", e => {
     const k = e.key.toLowerCase();
@@ -87,6 +91,8 @@
     const r = canvas.getBoundingClientRect();
     mouse.x = (e.clientX - r.left) * (W / r.width);
     mouse.y = (e.clientY - r.top) * (H / r.height);
+    mouseWorld.x = mouse.x + camera.x;
+    mouseWorld.y = mouse.y + camera.y;
   });
 
   canvas.addEventListener("mousedown", e => {
@@ -155,6 +161,10 @@
       mobile: !!mobile,   // shooter that advances while firing
       moveSpeed: 118,     // advance/retreat speed when mobile
       engageRange: 250,   // preferred distance a mobile shooter holds
+      active: true,       // explore levels start this false until you approach
+      hp: 1,              // hits to kill (bosses take many)
+      maxHp: 1,
+      hitFlash: 0,        // brief white flash when damaged but not killed
       alive: true,
     };
     if (type === "shotgun") { e.pellets = 3; e.spread = 0.30; e.cooldown = 1.9; e.engageRange = 190; }
@@ -163,11 +173,15 @@
     if (type === "bomber")  { e.cooldown = 2.6; e.r = 14; e.timer = 1.2 + Math.random(); }
     if (type === "rusher")  { e.speed = 135; }
     if (type === "brute")   { e.speed = 210; e.r = 21; }
+    if (type === "boss")    { e.r = 42; e.hp = 8; e.speed = 66; e.cooldown = 2.3;
+                              e.bulletSpeed = 260; e.timer = 1.6; }
+    e.maxHp = e.hp;
     return e;
   }
   const isCharger = en => en.type === "rusher" || en.type === "brute";
   const isShooter = en => en.type === "gunner" || en.type === "shotgun" ||
                           en.type === "sniper" || en.type === "dodger";
+  const ACTIVATE_DIST = 440;  // explore levels: how close before an enemy wakes
   let enemies = [];           // populated by loadLevel()
 
   // Build an enemy from a level def ({fx,fy,t}); UPPERCASE t = mobile shooter.
@@ -715,6 +729,255 @@
         ]},
       ],
     },
+    { // 34: LAST STAND — a crescendo. Waves arrive faster and heavier, a
+      //   bomber joins each one, and it ends in a brute swarm. 41 enemies.
+      player: { fx: 0.5, fy: 0.95, ammo: 6 },
+      time: 40,   // world-seconds
+      walls: [
+        { fx: 0.20, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.70, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.44, fy: 0.16, fw: 0.12, fh: 0.10 },
+        { fx: 0.30, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.62, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.16, fy: 0.64, fw: 0.10, fh: 0.08 },
+        { fx: 0.74, fy: 0.64, fw: 0.10, fh: 0.08 },
+      ],
+      enemies: [   // opening force (11) — 1 bomber
+        { fx: 0.12, fy: 0.12, t: "x" }, { fx: 0.88, fy: 0.12, t: "X" },
+        { fx: 0.30, fy: 0.11, t: "g" }, { fx: 0.70, fy: 0.11, t: "G" },
+        { fx: 0.50, fy: 0.30, t: "m" },
+        { fx: 0.18, fy: 0.40, t: "s" }, { fx: 0.82, fy: 0.40, t: "S" },
+        { fx: 0.40, fy: 0.22, t: "d" }, { fx: 0.60, fy: 0.22, t: "D" },
+        { fx: 0.30, fy: 0.54, t: "b" }, { fx: 0.70, fy: 0.54, t: "r" },
+      ],
+      waves: [
+        { at: 5,  enemies: [   // wave 1 (6) — flankers + 2nd bomber
+          { fx: 0.06, fy: 0.22, t: "G" }, { fx: 0.94, fy: 0.22, t: "G" },
+          { fx: 0.50, fy: 0.12, t: "m" }, { fx: 0.50, fy: 0.36, t: "D" },
+          { fx: 0.12, fy: 0.52, t: "r" }, { fx: 0.88, fy: 0.52, t: "r" },
+        ]},
+        { at: 10, enemies: [   // wave 2 (7) — heavies + 3rd bomber
+          { fx: 0.16, fy: 0.12, t: "X" }, { fx: 0.84, fy: 0.12, t: "X" },
+          { fx: 0.30, fy: 0.14, t: "m" }, { fx: 0.70, fy: 0.16, t: "S" },
+          { fx: 0.14, fy: 0.58, t: "b" }, { fx: 0.86, fy: 0.58, t: "b" },
+          { fx: 0.50, fy: 0.44, t: "D" },
+        ]},
+        { at: 14, enemies: [   // wave 3 (8) — the crush + 4th bomber
+          { fx: 0.10, fy: 0.12, t: "x" }, { fx: 0.90, fy: 0.12, t: "x" },
+          { fx: 0.30, fy: 0.14, t: "G" }, { fx: 0.70, fy: 0.14, t: "G" },
+          { fx: 0.50, fy: 0.10, t: "m" }, { fx: 0.20, fy: 0.42, t: "S" },
+          { fx: 0.40, fy: 0.60, t: "r" }, { fx: 0.60, fy: 0.60, t: "r" },
+        ]},
+        { at: 17.5, enemies: [ // wave 4 (9) — BRUTE SWARM climax + 5th bomber
+          { fx: 0.16, fy: 0.55, t: "b" }, { fx: 0.84, fy: 0.55, t: "b" }, { fx: 0.50, fy: 0.48, t: "b" },
+          { fx: 0.30, fy: 0.62, t: "b" }, { fx: 0.70, fy: 0.62, t: "b" },
+          { fx: 0.20, fy: 0.12, t: "X" }, { fx: 0.80, fy: 0.12, t: "X" },
+          { fx: 0.40, fy: 0.28, t: "m" }, { fx: 0.50, fy: 0.34, t: "D" },
+        ]},
+      ],
+    },
+    { // 35: THE COMPOUND — a traversable 2x2 world. Explore room to room;
+      //   enemies wake as you approach. Fight your way to the far corner.
+      world: { w: 1700, h: 1200 },
+      explore: true,
+      player: { fx: 0.12, fy: 0.88, ammo: 4 },
+      walls: [
+        // central cross of dividers with doorway gaps -> 4 rooms + a hub
+        { fx: 0.492, fy: 0.00, fw: 0.016, fh: 0.36 },
+        { fx: 0.492, fy: 0.64, fw: 0.016, fh: 0.36 },
+        { fx: 0.00,  fy: 0.492, fw: 0.36, fh: 0.016 },
+        { fx: 0.64,  fy: 0.492, fw: 0.36, fh: 0.016 },
+        // a cover block in each room
+        { fx: 0.15, fy: 0.15, fw: 0.08, fh: 0.08 },
+        { fx: 0.77, fy: 0.15, fw: 0.08, fh: 0.08 },
+        { fx: 0.15, fy: 0.77, fw: 0.08, fh: 0.08 },
+        { fx: 0.77, fy: 0.77, fw: 0.08, fh: 0.08 },
+      ],
+      enemies: [
+        // bottom-left = start room (light)
+        { fx: 0.10, fy: 0.62, t: "g" }, { fx: 0.22, fy: 0.68, t: "s" }, { fx: 0.30, fy: 0.82, t: "r" },
+        // top-left room
+        { fx: 0.10, fy: 0.12, t: "x" }, { fx: 0.30, fy: 0.20, t: "G" },
+        { fx: 0.18, fy: 0.35, t: "d" }, { fx: 0.10, fy: 0.44, t: "b" },
+        // bottom-right room
+        { fx: 0.90, fy: 0.62, t: "X" }, { fx: 0.72, fy: 0.80, t: "S" },
+        { fx: 0.85, fy: 0.70, t: "g" }, { fx: 0.68, fy: 0.60, t: "r" },
+        // top-right = final room (heavy)
+        { fx: 0.90, fy: 0.12, t: "x" }, { fx: 0.72, fy: 0.20, t: "X" },
+        { fx: 0.85, fy: 0.35, t: "D" }, { fx: 0.90, fy: 0.44, t: "b" },
+        { fx: 0.80, fy: 0.12, t: "m" },
+      ],
+    },
+    { // 36: THE STRONGHOLD — a 3x2 world, six packed rooms. More traversal,
+      //   far more chaos. Start bottom-left, punch through to the far corner.
+      world: { w: 2400, h: 1500 },
+      explore: true,
+      player: { fx: 0.10, fy: 0.90, ammo: 4 },
+      walls: [
+        // column divider 1 (fx~0.333): doorways in top & bottom rows
+        { fx: 0.329, fy: 0.00, fw: 0.008, fh: 0.16 },
+        { fx: 0.329, fy: 0.36, fw: 0.008, fh: 0.28 },
+        { fx: 0.329, fy: 0.84, fw: 0.008, fh: 0.16 },
+        // column divider 2 (fx~0.667)
+        { fx: 0.663, fy: 0.00, fw: 0.008, fh: 0.16 },
+        { fx: 0.663, fy: 0.36, fw: 0.008, fh: 0.28 },
+        { fx: 0.663, fy: 0.84, fw: 0.008, fh: 0.16 },
+        // row divider (fy~0.5): a doorway per column
+        { fx: 0.00, fy: 0.494, fw: 0.10, fh: 0.012 },
+        { fx: 0.24, fy: 0.494, fw: 0.18, fh: 0.012 },
+        { fx: 0.58, fy: 0.494, fw: 0.18, fh: 0.012 },
+        { fx: 0.90, fy: 0.494, fw: 0.10, fh: 0.012 },
+        // a cover block in each room
+        { fx: 0.13, fy: 0.20, fw: 0.06, fh: 0.07 },
+        { fx: 0.47, fy: 0.20, fw: 0.06, fh: 0.07 },
+        { fx: 0.80, fy: 0.20, fw: 0.06, fh: 0.07 },
+        { fx: 0.13, fy: 0.72, fw: 0.06, fh: 0.07 },
+        { fx: 0.47, fy: 0.72, fw: 0.06, fh: 0.07 },
+        { fx: 0.80, fy: 0.72, fw: 0.06, fh: 0.07 },
+      ],
+      enemies: [
+        // bottom-left = start room
+        { fx: 0.10, fy: 0.62, t: "g" }, { fx: 0.24, fy: 0.72, t: "s" },
+        { fx: 0.28, fy: 0.88, t: "r" }, { fx: 0.15, fy: 0.82, t: "d" },
+        // top-left room
+        { fx: 0.08, fy: 0.10, t: "x" }, { fx: 0.24, fy: 0.16, t: "G" },
+        { fx: 0.10, fy: 0.40, t: "b" }, { fx: 0.22, fy: 0.32, t: "s" },
+        // bottom-mid room
+        { fx: 0.42, fy: 0.62, t: "X" }, { fx: 0.58, fy: 0.86, t: "S" },
+        { fx: 0.50, fy: 0.74, t: "r" }, { fx: 0.44, fy: 0.90, t: "m" }, { fx: 0.57, fy: 0.62, t: "G" },
+        // top-mid room
+        { fx: 0.42, fy: 0.10, t: "x" }, { fx: 0.58, fy: 0.16, t: "D" },
+        { fx: 0.50, fy: 0.40, t: "b" }, { fx: 0.44, fy: 0.30, t: "g" },
+        // bottom-right room
+        { fx: 0.90, fy: 0.62, t: "X" }, { fx: 0.72, fy: 0.86, t: "S" },
+        { fx: 0.85, fy: 0.74, t: "r" }, { fx: 0.78, fy: 0.90, t: "d" }, { fx: 0.90, fy: 0.56, t: "G" },
+        // top-right = final room (heaviest)
+        { fx: 0.90, fy: 0.10, t: "x" }, { fx: 0.72, fy: 0.16, t: "X" },
+        { fx: 0.85, fy: 0.30, t: "D" }, { fx: 0.90, fy: 0.42, t: "b" },
+        { fx: 0.80, fy: 0.10, t: "m" }, { fx: 0.72, fy: 0.40, t: "b" },
+      ],
+    },
+    { // 37: THE CITADEL — six packed rooms and a GIANT boss guarding the last.
+      //   More enemies, more chaos. The boss takes many hits and spews bullet
+      //   rings — kill it from range while dodging in slow-mo.
+      world: { w: 2600, h: 1600 },
+      explore: true,
+      player: { fx: 0.10, fy: 0.90, ammo: 5 },
+      walls: [
+        { fx: 0.329, fy: 0.00, fw: 0.008, fh: 0.16 },
+        { fx: 0.329, fy: 0.36, fw: 0.008, fh: 0.28 },
+        { fx: 0.329, fy: 0.84, fw: 0.008, fh: 0.16 },
+        { fx: 0.663, fy: 0.00, fw: 0.008, fh: 0.16 },
+        { fx: 0.663, fy: 0.36, fw: 0.008, fh: 0.28 },
+        { fx: 0.663, fy: 0.84, fw: 0.008, fh: 0.16 },
+        { fx: 0.00, fy: 0.494, fw: 0.10, fh: 0.012 },
+        { fx: 0.24, fy: 0.494, fw: 0.18, fh: 0.012 },
+        { fx: 0.58, fy: 0.494, fw: 0.18, fh: 0.012 },
+        { fx: 0.90, fy: 0.494, fw: 0.10, fh: 0.012 },
+        { fx: 0.13, fy: 0.20, fw: 0.06, fh: 0.07 },
+        { fx: 0.47, fy: 0.20, fw: 0.06, fh: 0.07 },
+        { fx: 0.13, fy: 0.72, fw: 0.06, fh: 0.07 },
+        { fx: 0.47, fy: 0.72, fw: 0.06, fh: 0.07 },
+        { fx: 0.80, fy: 0.72, fw: 0.06, fh: 0.07 },
+      ],
+      enemies: [
+        // bottom-left = start room (5)
+        { fx: 0.08, fy: 0.60, t: "g" }, { fx: 0.22, fy: 0.70, t: "s" }, { fx: 0.28, fy: 0.88, t: "r" },
+        { fx: 0.14, fy: 0.82, t: "d" }, { fx: 0.20, fy: 0.58, t: "G" },
+        // top-left room (6)
+        { fx: 0.06, fy: 0.10, t: "x" }, { fx: 0.24, fy: 0.14, t: "G" }, { fx: 0.10, fy: 0.40, t: "b" },
+        { fx: 0.22, fy: 0.30, t: "s" }, { fx: 0.16, fy: 0.22, t: "d" }, { fx: 0.28, fy: 0.44, t: "r" },
+        // bottom-mid room (6)
+        { fx: 0.42, fy: 0.60, t: "X" }, { fx: 0.58, fy: 0.86, t: "S" }, { fx: 0.50, fy: 0.74, t: "r" },
+        { fx: 0.44, fy: 0.90, t: "G" }, { fx: 0.56, fy: 0.60, t: "m" }, { fx: 0.62, fy: 0.78, t: "b" },
+        // top-mid room (5)
+        { fx: 0.42, fy: 0.10, t: "x" }, { fx: 0.58, fy: 0.16, t: "D" }, { fx: 0.50, fy: 0.40, t: "b" },
+        { fx: 0.44, fy: 0.30, t: "g" }, { fx: 0.60, fy: 0.44, t: "X" },
+        // bottom-right room (6)
+        { fx: 0.90, fy: 0.60, t: "X" }, { fx: 0.72, fy: 0.86, t: "S" }, { fx: 0.85, fy: 0.74, t: "r" },
+        { fx: 0.78, fy: 0.90, t: "d" }, { fx: 0.90, fy: 0.56, t: "G" }, { fx: 0.70, fy: 0.62, t: "b" },
+        // top-right = final room: the boss + an escort (6 + BOSS)
+        { fx: 0.90, fy: 0.10, t: "x" }, { fx: 0.72, fy: 0.14, t: "X" }, { fx: 0.92, fy: 0.44, t: "b" },
+        { fx: 0.72, fy: 0.42, t: "S" }, { fx: 0.80, fy: 0.08, t: "m" }, { fx: 0.70, fy: 0.26, t: "D" },
+        { fx: 0.84, fy: 0.34, t: "k" },
+      ],
+    },
+    { // 38: OVERRUN — a 4x2 world, eight rooms, ~39 enemies, TWO giant bosses.
+      //   A miniboss mid-journey and a guardian at the end. Total war.
+      world: { w: 3200, h: 1500 },
+      explore: true,
+      player: { fx: 0.06, fy: 0.90, ammo: 6 },
+      walls: [
+        // three vertical column dividers (fx 0.25 / 0.50 / 0.75), doorways top+bottom
+        { fx: 0.247, fy: 0.00, fw: 0.006, fh: 0.16 }, { fx: 0.247, fy: 0.36, fw: 0.006, fh: 0.28 }, { fx: 0.247, fy: 0.84, fw: 0.006, fh: 0.16 },
+        { fx: 0.497, fy: 0.00, fw: 0.006, fh: 0.16 }, { fx: 0.497, fy: 0.36, fw: 0.006, fh: 0.28 }, { fx: 0.497, fy: 0.84, fw: 0.006, fh: 0.16 },
+        { fx: 0.747, fy: 0.00, fw: 0.006, fh: 0.16 }, { fx: 0.747, fy: 0.36, fw: 0.006, fh: 0.28 }, { fx: 0.747, fy: 0.84, fw: 0.006, fh: 0.16 },
+        // one horizontal row divider (fy 0.5) with a doorway per column
+        { fx: 0.00, fy: 0.495, fw: 0.075, fh: 0.01 }, { fx: 0.175, fy: 0.495, fw: 0.15, fh: 0.01 },
+        { fx: 0.425, fy: 0.495, fw: 0.15, fh: 0.01 }, { fx: 0.675, fy: 0.495, fw: 0.15, fh: 0.01 },
+        { fx: 0.925, fy: 0.495, fw: 0.075, fh: 0.01 },
+        // a cover block in each of the 8 rooms
+        { fx: 0.09, fy: 0.20, fw: 0.045, fh: 0.06 }, { fx: 0.34, fy: 0.20, fw: 0.045, fh: 0.06 },
+        { fx: 0.59, fy: 0.20, fw: 0.045, fh: 0.06 }, { fx: 0.84, fy: 0.20, fw: 0.045, fh: 0.06 },
+        { fx: 0.09, fy: 0.72, fw: 0.045, fh: 0.06 }, { fx: 0.34, fy: 0.72, fw: 0.045, fh: 0.06 },
+        { fx: 0.59, fy: 0.72, fw: 0.045, fh: 0.06 }, { fx: 0.84, fy: 0.72, fw: 0.045, fh: 0.06 },
+      ],
+      enemies: [
+        // col0 bottom = start (4)
+        { fx: 0.06, fy: 0.62, t: "g" }, { fx: 0.16, fy: 0.72, t: "s" }, { fx: 0.20, fy: 0.88, t: "r" }, { fx: 0.10, fy: 0.82, t: "d" },
+        // col0 top (5)
+        { fx: 0.05, fy: 0.10, t: "x" }, { fx: 0.18, fy: 0.14, t: "G" }, { fx: 0.08, fy: 0.40, t: "b" }, { fx: 0.16, fy: 0.30, t: "s" }, { fx: 0.12, fy: 0.22, t: "r" },
+        // col1 bottom (5)
+        { fx: 0.30, fy: 0.62, t: "X" }, { fx: 0.44, fy: 0.86, t: "S" }, { fx: 0.38, fy: 0.74, t: "r" }, { fx: 0.32, fy: 0.90, t: "G" }, { fx: 0.45, fy: 0.60, t: "b" },
+        // col1 top (5)
+        { fx: 0.30, fy: 0.10, t: "x" }, { fx: 0.44, fy: 0.16, t: "D" }, { fx: 0.38, fy: 0.40, t: "b" }, { fx: 0.32, fy: 0.30, t: "g" }, { fx: 0.46, fy: 0.24, t: "m" },
+        // col2 bottom = MINIBOSS room (5 + boss)
+        { fx: 0.55, fy: 0.62, t: "X" }, { fx: 0.70, fy: 0.86, t: "S" }, { fx: 0.66, fy: 0.74, t: "r" }, { fx: 0.56, fy: 0.90, t: "d" }, { fx: 0.70, fy: 0.60, t: "G" },
+        { fx: 0.62, fy: 0.76, t: "k" },
+        // col2 top (5)
+        { fx: 0.55, fy: 0.10, t: "x" }, { fx: 0.70, fy: 0.16, t: "X" }, { fx: 0.62, fy: 0.40, t: "b" }, { fx: 0.56, fy: 0.28, t: "d" }, { fx: 0.70, fy: 0.44, t: "G" },
+        // col3 bottom (5)
+        { fx: 0.80, fy: 0.62, t: "X" }, { fx: 0.94, fy: 0.86, t: "S" }, { fx: 0.88, fy: 0.74, t: "r" }, { fx: 0.82, fy: 0.90, t: "d" }, { fx: 0.94, fy: 0.58, t: "G" },
+        // col3 top = FINAL boss room (5 + boss)
+        { fx: 0.94, fy: 0.10, t: "x" }, { fx: 0.80, fy: 0.14, t: "X" }, { fx: 0.90, fy: 0.42, t: "b" }, { fx: 0.80, fy: 0.42, t: "S" }, { fx: 0.87, fy: 0.08, t: "m" },
+        { fx: 0.87, fy: 0.32, t: "k" },
+      ],
+    },
+    { // 39: MEAT GRINDER — six rooms, ~8-9 enemies EACH (51 + a boss). Every
+      //   room is a wall of red the moment you step in. Maximum density.
+      world: { w: 2800, h: 1700 },
+      explore: true,
+      player: { fx: 0.06, fy: 0.90, ammo: 6 },
+      walls: [
+        { fx: 0.329, fy: 0.00, fw: 0.008, fh: 0.16 }, { fx: 0.329, fy: 0.36, fw: 0.008, fh: 0.28 }, { fx: 0.329, fy: 0.84, fw: 0.008, fh: 0.16 },
+        { fx: 0.663, fy: 0.00, fw: 0.008, fh: 0.16 }, { fx: 0.663, fy: 0.36, fw: 0.008, fh: 0.28 }, { fx: 0.663, fy: 0.84, fw: 0.008, fh: 0.16 },
+        { fx: 0.00, fy: 0.494, fw: 0.10, fh: 0.012 }, { fx: 0.24, fy: 0.494, fw: 0.18, fh: 0.012 },
+        { fx: 0.58, fy: 0.494, fw: 0.18, fh: 0.012 }, { fx: 0.90, fy: 0.494, fw: 0.10, fh: 0.012 },
+        { fx: 0.13, fy: 0.20, fw: 0.06, fh: 0.07 }, { fx: 0.47, fy: 0.20, fw: 0.06, fh: 0.07 }, { fx: 0.80, fy: 0.20, fw: 0.06, fh: 0.07 },
+        { fx: 0.13, fy: 0.72, fw: 0.06, fh: 0.07 }, { fx: 0.47, fy: 0.72, fw: 0.06, fh: 0.07 }, { fx: 0.80, fy: 0.72, fw: 0.06, fh: 0.07 },
+      ],
+      enemies: [
+        // col0 bottom = start (7)
+        { fx: 0.06, fy: 0.60, t: "g" }, { fx: 0.16, fy: 0.60, t: "s" }, { fx: 0.26, fy: 0.62, t: "r" }, { fx: 0.08, fy: 0.75, t: "d" },
+        { fx: 0.20, fy: 0.78, t: "g" }, { fx: 0.12, fy: 0.90, t: "r" }, { fx: 0.24, fy: 0.88, t: "s" },
+        // col0 top (9)
+        { fx: 0.05, fy: 0.08, t: "x" }, { fx: 0.16, fy: 0.08, t: "G" }, { fx: 0.27, fy: 0.10, t: "x" }, { fx: 0.06, fy: 0.24, t: "s" }, { fx: 0.17, fy: 0.26, t: "d" },
+        { fx: 0.28, fy: 0.24, t: "b" }, { fx: 0.08, fy: 0.40, t: "g" }, { fx: 0.20, fy: 0.42, t: "r" }, { fx: 0.28, fy: 0.40, t: "s" },
+        // col1 bottom (9)
+        { fx: 0.40, fy: 0.60, t: "X" }, { fx: 0.50, fy: 0.60, t: "S" }, { fx: 0.60, fy: 0.62, t: "G" }, { fx: 0.38, fy: 0.76, t: "r" }, { fx: 0.50, fy: 0.84, t: "m" },
+        { fx: 0.62, fy: 0.74, t: "b" }, { fx: 0.42, fy: 0.90, t: "r" }, { fx: 0.54, fy: 0.90, t: "S" }, { fx: 0.60, fy: 0.88, t: "G" },
+        // col1 top (9)
+        { fx: 0.40, fy: 0.08, t: "x" }, { fx: 0.50, fy: 0.08, t: "D" }, { fx: 0.60, fy: 0.10, t: "x" }, { fx: 0.38, fy: 0.24, t: "g" }, { fx: 0.50, fy: 0.26, t: "b" },
+        { fx: 0.62, fy: 0.24, t: "d" }, { fx: 0.40, fy: 0.42, t: "G" }, { fx: 0.52, fy: 0.42, t: "b" }, { fx: 0.60, fy: 0.40, t: "m" },
+        // col2 bottom (9)
+        { fx: 0.72, fy: 0.60, t: "X" }, { fx: 0.83, fy: 0.60, t: "S" }, { fx: 0.94, fy: 0.62, t: "G" }, { fx: 0.74, fy: 0.76, t: "r" }, { fx: 0.86, fy: 0.78, t: "d" },
+        { fx: 0.95, fy: 0.74, t: "b" }, { fx: 0.76, fy: 0.90, t: "r" }, { fx: 0.88, fy: 0.90, t: "S" }, { fx: 0.94, fy: 0.86, t: "d" },
+        // col2 top = FINAL boss room (8 + boss)
+        { fx: 0.72, fy: 0.08, t: "x" }, { fx: 0.84, fy: 0.08, t: "X" }, { fx: 0.95, fy: 0.10, t: "x" }, { fx: 0.74, fy: 0.24, t: "D" }, { fx: 0.95, fy: 0.24, t: "b" },
+        { fx: 0.72, fy: 0.42, t: "S" }, { fx: 0.88, fy: 0.42, t: "b" }, { fx: 0.80, fy: 0.10, t: "m" },
+        { fx: 0.86, fy: 0.32, t: "k" },
+      ],
+    },
   ];
 
   // ---- Game state ----
@@ -733,11 +996,16 @@
   const SPAWN_TELEGRAPH = 0.7; // world-seconds of warning before a wave lands
 
   const TYPE_MAP = { g: "gunner", s: "shotgun", x: "sniper", d: "dodger",
-                     m: "bomber", r: "rusher", b: "brute" };
+                     m: "bomber", r: "rusher", b: "brute", k: "boss" };
 
   function loadLevel(i) {
     levelIndex = i;
     const L = LEVELS[i];
+    // world size: bigger for "explore" levels; default is one screenful
+    room.x = 40; room.y = 40;
+    room.w = (L.world ? L.world.w : W) - 80;
+    room.h = (L.world ? L.world.h : H) - 80;
+    const explore = !!L.explore;   // dormant enemies that wake as you approach
     bullets.length = 0;
     pickups.length = 0;
     shards.length = 0;
@@ -749,6 +1017,7 @@
       w: room.w * w.fw,          h: room.h * w.fh,
     }));
     enemies = L.enemies.map(makeEnemyFromDef);
+    if (explore) for (const en of enemies) en.active = false;
     restaggerBombers();
     // Reinforcement waves (if any): stored, spawned later at their world-time.
     levelElapsed = 0;
@@ -765,6 +1034,7 @@
     hitFlash = 0;
     meleeSwing = 0;
     state = STATE.PLAYING;
+    updateCamera(0);   // snap the camera onto the player immediately
   }
 
   function restartLevel() { loadLevel(levelIndex); }
@@ -858,10 +1128,43 @@
     // Enemies: chargers rush + kill on contact; shooters fire on line-of-sight.
     for (const en of enemies) {
       if (!en.alive) continue;
+      // Dormant (explore-level) enemies wake up once you get close.
+      if (!en.active) {
+        if (Math.hypot(en.x - player.x, en.y - player.y) < ACTIVATE_DIST) en.active = true;
+        else continue;
+      }
+      if (en.hitFlash > 0) en.hitFlash = Math.max(0, en.hitFlash - dt * 4);
       const wantAim = Math.atan2(player.y - en.y, player.x - en.x);
       en.aim = angLerp(en.aim, wantAim, clamp(6 * tdt, 0, 1));
 
-      if (isCharger(en)) {
+      if (en.type === "boss") {
+        // Giant: lumbers toward you (contact = death) and periodically
+        // unleashes a radial bullet burst you have to weave through.
+        en.x += Math.cos(en.aim) * en.speed * tdt;
+        en.y += Math.sin(en.aim) * en.speed * tdt;
+        resolveCircleObstacles(en, en.r);
+        en.x = clamp(en.x, room.x + en.r, room.x + room.w - en.r);
+        en.y = clamp(en.y, room.y + en.r, room.y + room.h - en.r);
+        if (Math.hypot(en.x - player.x, en.y - player.y) <= en.r + player.r) {
+          onPlayerDeath();
+        }
+        en.timer -= tdt;
+        if (en.timer <= 0) {
+          en.timer = en.cooldown;
+          const N = 16, off = Math.random() * Math.PI * 2;
+          for (let p = 0; p < N; p++) {
+            const a = off + (p / N) * Math.PI * 2;
+            const bx = en.x + Math.cos(a) * (en.r + 6);
+            const by = en.y + Math.sin(a) * (en.r + 6);
+            bullets.push({
+              x: bx, y: by, px: bx, py: by,
+              vx: Math.cos(a) * en.bulletSpeed,
+              vy: Math.sin(a) * en.bulletSpeed,
+              life: 6, owner: "enemy",
+            });
+          }
+        }
+      } else if (isCharger(en)) {
         en.x += Math.cos(en.aim) * en.speed * tdt;
         en.y += Math.sin(en.aim) * en.speed * tdt;
         resolveCircleObstacles(en, en.r);   // chargers slide off walls too
@@ -1019,12 +1322,12 @@
           onPlayerDeath();
         }
       } else {
-        // player bullet -> kill first enemy it sweeps through
+        // player bullet -> damage first enemy it sweeps through
         let hit = false;
         for (const en of enemies) {
           if (!en.alive) continue;
           if (segCircleHit(b.px, b.py, b.x, b.y, en.x, en.y, en.r + BULLET_R)) {
-            killEnemy(en);
+            damageEnemy(en);
             hit = true;
             break;
           }
@@ -1048,7 +1351,7 @@
       for (const en of enemies) {
         if (!en.alive) continue;
         if (segCircleHit(t.px, t.py, t.x, t.y, en.x, en.y, en.r + t.r)) {
-          killEnemy(en);
+          damageEnemy(en);
           landThrown(t, en.x, en.y);
           killed = true;
           break;
@@ -1135,7 +1438,7 @@
   // ---- Melee: kill enemies in a forward cone at close range ----
   function doMelee() {
     meleeSwing = MELEE_SWING_TIME;
-    const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+    const aim = Math.atan2(mouseWorld.y - player.y, mouseWorld.x - player.x);
     for (const en of enemies) {
       if (!en.alive) continue;
       const dx = en.x - player.x, dy = en.y - player.y;
@@ -1144,7 +1447,7 @@
       // within forward arc?
       const toEn = Math.atan2(dy, dx);
       let d = Math.abs(((toEn - aim + Math.PI) % (Math.PI * 2)) - Math.PI);
-      if (d <= MELEE_ARC) killEnemy(en);
+      if (d <= MELEE_ARC) damageEnemy(en);
     }
   }
 
@@ -1153,7 +1456,7 @@
     if (player.ammo <= 0) return;
     player.ammo--;
     meleeSwing = 0;
-    const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+    const aim = Math.atan2(mouseWorld.y - player.y, mouseWorld.x - player.x);
     const muzzle = player.r + 6;
     const bx = player.x + Math.cos(aim) * muzzle;
     const by = player.y + Math.sin(aim) * muzzle;
@@ -1173,7 +1476,7 @@
     player.hasGun = false;          // your hands are now empty
     player.ammo = 0;
     meleeSwing = 0;
-    const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+    const aim = Math.atan2(mouseWorld.y - player.y, mouseWorld.x - player.x);
     const muzzle = player.r + 8;
     const tx = player.x + Math.cos(aim) * muzzle;
     const ty = player.y + Math.sin(aim) * muzzle;
@@ -1194,17 +1497,27 @@
     });
   }
 
-  const DROP_AMMO = { gunner: 2, shotgun: 3, sniper: 2, dodger: 2 };
+  const DROP_AMMO = { gunner: 2, shotgun: 3, sniper: 2, dodger: 2, boss: 4 };
+  // Apply one hit. Most enemies die instantly (hp 1); bosses whittle down.
+  // Returns true if the enemy died.
+  function damageEnemy(en) {
+    en.hp--;
+    if (en.hp <= 0) { killEnemy(en); return true; }
+    en.hitFlash = 0.3;                 // flash white
+    spawnShatter(en.x, en.y, 3);       // a few chips fly off, but it lives
+    return false;
+  }
+
   function killEnemy(en) {
     en.alive = false;
-    spawnShatter(en.x, en.y);
+    spawnShatter(en.x, en.y, en.type === "boss" ? 22 : undefined);
     // armed enemies drop their weapon; chargers carry nothing
     const ammo = DROP_AMMO[en.type];
     if (ammo) pickups.push({ x: en.x, y: en.y, ammo, r: PICKUP_R });
   }
 
-  function spawnShatter(x, y) {
-    const n = 7 + (Math.random() * 3 | 0);
+  function spawnShatter(x, y, count) {
+    const n = count != null ? count : 7 + (Math.random() * 3 | 0);
     for (let i = 0; i < n; i++) {
       const ang = Math.random() * Math.PI * 2;
       const spd = 90 + Math.random() * 160;
@@ -1356,16 +1669,10 @@
 
   // ---- Draw ----
   function drawRoom() {
-    // floor
+    // floor covers the whole play area (world coords)
     ctx.fillStyle = COL.floor;
-    ctx.fillRect(0, 0, W, H);
-    // wall border (thick frame)
-    ctx.fillStyle = COL.wall;
-    ctx.fillRect(0, 0, W, room.y);                       // top
-    ctx.fillRect(0, room.y + room.h, W, H - (room.y+room.h)); // bottom
-    ctx.fillRect(0, 0, room.x, H);                       // left
-    ctx.fillRect(room.x + room.w, 0, W - (room.x+room.w), H); // right
-    // inner edge line
+    ctx.fillRect(room.x, room.y, room.w, room.h);
+    // inner edge line around the world
     ctx.strokeStyle = COL.wallEdge;
     ctx.lineWidth = 2;
     ctx.strokeRect(room.x, room.y, room.w, room.h);
@@ -1402,7 +1709,7 @@
   }
 
   function drawPlayer() {
-    const aim = Math.atan2(mouse.y - player.y, mouse.x - player.x);
+    const aim = Math.atan2(mouseWorld.y - player.y, mouseWorld.x - player.x);
     // aim guide line (thin)
     ctx.strokeStyle = "rgba(0,0,0,0.18)";
     ctx.lineWidth = 1.5;
@@ -1430,10 +1737,44 @@
     drawHumanoid(player.x, player.y, player.r, aim, COL.player, "#333");
   }
 
+  function drawBoss(en) {
+    // big body
+    ctx.fillStyle = COL.enemy;
+    ctx.beginPath();
+    ctx.arc(en.x, en.y, en.r, 0, Math.PI * 2);
+    ctx.fill();
+    // heavy concentric rings to read as armored/menacing
+    ctx.strokeStyle = COL.enemyDk;
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.arc(en.x, en.y, en.r - 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(en.x, en.y, en.r - 16, 0, Math.PI * 2); ctx.stroke();
+    // dark core
+    ctx.fillStyle = COL.enemyDk;
+    ctx.beginPath(); ctx.arc(en.x, en.y, en.r * 0.28, 0, Math.PI * 2); ctx.fill();
+    // white flash on a non-lethal hit
+    if (en.hitFlash > 0) {
+      ctx.fillStyle = "rgba(255,255,255," + (0.6 * en.hitFlash).toFixed(2) + ")";
+      ctx.beginPath(); ctx.arc(en.x, en.y, en.r, 0, Math.PI * 2); ctx.fill();
+    }
+    // health pips above it
+    const pw = en.r * 2, ph = 6, px = en.x - en.r, py = en.y - en.r - 16;
+    ctx.fillStyle = "rgba(0,0,0,0.15)";
+    ctx.fillRect(px, py, pw, ph);
+    ctx.fillStyle = COL.enemy;
+    ctx.fillRect(px, py, pw * (en.hp / en.maxHp), ph);
+    ctx.strokeStyle = COL.enemyDk;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px, py, pw, ph);
+  }
+
   function drawEnemies() {
     for (const en of enemies) {
       if (!en.alive) continue;
-      if (isCharger(en)) {
+      ctx.globalAlpha = en.active ? 1 : 0.4;   // dormant enemies are faded
+      if (en.type === "boss") {
+        drawBoss(en);
+      } else if (isCharger(en)) {
         // unarmed charger: body + a forward-pointing wedge (no gun arm)
         ctx.fillStyle = COL.enemy;
         ctx.beginPath();
@@ -1528,6 +1869,7 @@
         }
       }
     }
+    ctx.globalAlpha = 1;
   }
 
   function drawPickups() {
@@ -1670,8 +2012,8 @@
   }
 
   function drawTimeMeter() {
-    // top-left thin bar showing current time flow
-    const bw = 160, bh = 8, bx = room.x + 8, by = room.y + 8;
+    // top-left thin bar showing current time flow (screen-fixed)
+    const bw = 160, bh = 8, bx = 48, by = 48;
     ctx.fillStyle = "rgba(0,0,0,0.08)";
     ctx.fillRect(bx, by, bw, bh);
     ctx.fillStyle = COL.accent;
@@ -1700,6 +2042,13 @@
   }
 
   function draw() {
+    // backdrop fills the whole screen (the gray "outside" the world)
+    ctx.fillStyle = COL.wall;
+    ctx.fillRect(0, 0, W, H);
+
+    // --- world, drawn through the camera ---
+    ctx.save();
+    ctx.translate(-Math.round(camera.x), -Math.round(camera.y));
     drawRoom();
     drawBlasts();       // danger zones on the floor, under everything
     drawSpawnFx();      // incoming-reinforcement telegraphs
@@ -1710,6 +2059,9 @@
     drawGrenades();
     drawBullets();
     drawPlayer();
+    ctx.restore();
+
+    // --- HUD, drawn in screen space ---
     drawTimeMeter();
     drawAmmo();
     drawLevelLabel();
@@ -1725,10 +2077,10 @@
     ctx.font = "bold 22px Helvetica Neue, Arial";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    ctx.fillText(levelTimeLeft.toFixed(1) + "s", W / 2, room.y + 8);
+    ctx.fillText(levelTimeLeft.toFixed(1) + "s", W / 2, 44);
     ctx.font = "10px Helvetica Neue, Arial";
     ctx.fillStyle = "#888";
-    ctx.fillText("TIME LEFT", W / 2, room.y + 32);
+    ctx.fillText("TIME LEFT", W / 2, 68);
     ctx.textAlign = "left";
   }
 
@@ -1738,7 +2090,7 @@
     ctx.textBaseline = "bottom";
     ctx.textAlign = "left";
     ctx.fillText("LEVEL " + (levelIndex + 1) + " / " + LEVELS.length,
-                 room.x + 8, room.y + room.h - 8);
+                 48, H - 48);
   }
 
   function drawOverlays() {
@@ -1820,8 +2172,22 @@
     const label = player.ammo > 0 ? ("AMMO " + player.ammo)
                 : player.hasGun    ? "EMPTY — THROW / PUNCH"
                 :                    "UNARMED — PUNCH";
-    ctx.fillText(label, room.x + room.w - 8, room.y + 8);
+    ctx.fillText(label, W - 48, 48);
     ctx.textAlign = "left";
+  }
+
+  // ---- Camera: center on the player, clamped to the world (room) bounds ----
+  function updateCamera(dt) {
+    const maxX = Math.max(0, room.x + room.w + 40 - W);
+    const maxY = Math.max(0, room.y + room.h + 40 - H);
+    const tx = clamp(player.x - W / 2, 0, maxX);
+    const ty = clamp(player.y - H / 2, 0, maxY);
+    // ease toward target so scrolling feels smooth (snap on the first frame)
+    const k = dt ? clamp(12 * dt, 0, 1) : 1;
+    camera.x += (tx - camera.x) * k;
+    camera.y += (ty - camera.y) * k;
+    mouseWorld.x = mouse.x + camera.x;
+    mouseWorld.y = mouse.y + camera.y;
   }
 
   // ---- Loop ----
@@ -1831,6 +2197,7 @@
     last = now;
     if (dt > 0.05) dt = 0.05; // clamp big hitches (tab switches)
     update(dt);
+    updateCamera(dt);
     draw();
     requestAnimationFrame(frame);
   }
