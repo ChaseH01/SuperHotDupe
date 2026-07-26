@@ -99,6 +99,7 @@
     if (e.button === 0 && state === STATE.WON) { state = STATE.SELECT; return; }
     if (state === STATE.SELECT) {
       if (e.button !== 0) return;
+      if (mouse.y < SEL_TOP || mouse.y > SEL_BOT) return;   // ignore clicks outside the grid band
       for (const cell of selectCells()) {
         if (mouse.x >= cell.x && mouse.x <= cell.x + cell.w &&
             mouse.y >= cell.y && mouse.y <= cell.y + cell.h) {
@@ -117,6 +118,11 @@
     }
   });
   canvas.addEventListener("contextmenu", e => e.preventDefault());
+  canvas.addEventListener("wheel", e => {
+    if (state !== STATE.SELECT) return;
+    selectScroll += e.deltaY;   // clamped against content bounds in selectCells()
+    e.preventDefault();
+  }, { passive: false });
 
   // ---- Player ----
   const player = {
@@ -144,6 +150,8 @@
   //              ignoring walls — punishes camping cover.
   //   rusher   : unarmed, charges the player, kills on contact, no drop.
   //   brute    : big + fast rusher, no drop. A wall of a man.
+  //   seeker   : fires a homing MISSILE that tracks you — can't be sidestepped,
+  //              must be juked into a wall or outmaneuvered. Drops a gun.
   // Firing types only shoot when they have line-of-sight (walls = cover).
   function makeEnemy(x, y, type, mobile) {
     type = type || "gunner";
@@ -173,6 +181,8 @@
     if (type === "bomber")  { e.cooldown = 2.6; e.r = 14; e.timer = 1.2 + Math.random(); }
     if (type === "rusher")  { e.speed = 135; }
     if (type === "brute")   { e.speed = 210; e.r = 21; }
+    if (type === "seeker")  { e.cooldown = 3.2; e.r = 14; e.engageRange = 300;
+                              e.timer = 1.4 + Math.random(); }
     if (type === "boss")    { e.r = 42; e.hp = 8; e.speed = 66; e.cooldown = 2.3;
                               e.bulletSpeed = 260; e.timer = 1.6; }
     e.maxHp = e.hp;
@@ -195,11 +205,31 @@
   // land on a steady beat (~one every BOMB_INTERVAL) instead of a synced volley.
   function restaggerBombers() {
     const bombers = enemies.filter(en => en.alive && en.type === "bomber");
+    const L = LEVELS[levelIndex];
+    if (L && L.bombStorm) {
+      // Storm mode: every bomber keeps its OWN quick cadence, so packing in
+      // more bombers genuinely rains down more bombs (used for the bomb levels).
+      const iv = L.bombInterval || 2.0;
+      bombers.forEach((b, k) => {
+        b.cooldown = iv;
+        b.timer = 0.5 + (k % 8) * (iv / 8);   // spread opening throws so they don't sync
+      });
+      return;
+    }
     bombers.forEach((b, k) => {
       b.cooldown = BOMB_INTERVAL * bombers.length;
       b.timer = 0.9 + k * BOMB_INTERVAL;
     });
   }
+
+  // Seeker ordnance: homing missiles. Steer toward the player each frame with a
+  // capped turn rate — slower than you, so you outmaneuver them (juke into walls,
+  // curve them past you) rather than sidestep. Advance on world-time like all else.
+  const missiles = [];   // { x, y, px, py, vx, vy, life }
+  const MISSILE_SPEED = 168;   // < player speed (260) so juking works
+  const MISSILE_TURN = 2.7;    // radians/sec it can rotate toward you (time-scaled)
+  const MISSILE_LIFE = 4.5;    // world-seconds before it fizzles out
+  const MISSILE_R = 6;
 
   // Bomber ordnance.
   const grenades = [];   // in-flight: { x, y, tx, ty, vx, vy }
@@ -225,6 +255,13 @@
 
   // Interior walls (cover). Absolute rects, populated by loadLevel().
   let obstacles = [];         // { x, y, w, h }
+
+  // Room triggers: each room arms when the player first enters it — waking its
+  // garrison and starting its own reinforcement waves (spawned at the room's
+  // edges to flank you). Lets a big explorable map feel like a chain of
+  // single-arena "Level 33" fights. Populated by loadLevel().
+  //   { x,y,w,h, fx,fy,fw,fh, waves:[{after,enemies,telegraphed,done}], triggered, elapsed }
+  let rooms = [];
 
   // Bullets travel only when time flows (their motion is time-scaled).
   const bullets = [];   // { x, y, vx, vy, life, px, py, owner }
@@ -978,6 +1015,328 @@
         { fx: 0.86, fy: 0.32, t: "k" },
       ],
     },
+    { // 40: THE SLAUGHTERHOUSE — six rooms at ~16 enemies EACH, no interior
+      //   cover, capped by a boss. ~96 enemies. Every room is a firing line.
+      world: { w: 3000, h: 1900 },
+      explore: true,
+      player: { fx: 0.04, fy: 0.96, ammo: 6 },
+      walls: [
+        { fx: 0.329, fy: 0.00, fw: 0.008, fh: 0.16 }, { fx: 0.329, fy: 0.36, fw: 0.008, fh: 0.28 }, { fx: 0.329, fy: 0.84, fw: 0.008, fh: 0.16 },
+        { fx: 0.663, fy: 0.00, fw: 0.008, fh: 0.16 }, { fx: 0.663, fy: 0.36, fw: 0.008, fh: 0.28 }, { fx: 0.663, fy: 0.84, fw: 0.008, fh: 0.16 },
+        { fx: 0.00, fy: 0.494, fw: 0.10, fh: 0.012 }, { fx: 0.24, fy: 0.494, fw: 0.18, fh: 0.012 },
+        { fx: 0.58, fy: 0.494, fw: 0.18, fh: 0.012 }, { fx: 0.90, fy: 0.494, fw: 0.10, fh: 0.012 },
+      ],
+      enemies: [
+        // col0 bottom = start room (16)
+        { fx: 0.06, fy: 0.59, t: "g" }, { fx: 0.14, fy: 0.59, t: "r" }, { fx: 0.22, fy: 0.59, t: "s" }, { fx: 0.29, fy: 0.59, t: "r" },
+        { fx: 0.06, fy: 0.70, t: "d" }, { fx: 0.14, fy: 0.70, t: "g" }, { fx: 0.22, fy: 0.70, t: "r" }, { fx: 0.29, fy: 0.70, t: "b" },
+        { fx: 0.06, fy: 0.82, t: "r" }, { fx: 0.14, fy: 0.82, t: "s" }, { fx: 0.22, fy: 0.82, t: "d" }, { fx: 0.29, fy: 0.82, t: "r" },
+        { fx: 0.10, fy: 0.93, t: "r" }, { fx: 0.18, fy: 0.93, t: "s" }, { fx: 0.25, fy: 0.93, t: "d" }, { fx: 0.30, fy: 0.90, t: "g" },
+        // col0 top (16)
+        { fx: 0.06, fy: 0.08, t: "x" }, { fx: 0.14, fy: 0.08, t: "G" }, { fx: 0.22, fy: 0.08, t: "x" }, { fx: 0.29, fy: 0.08, t: "s" },
+        { fx: 0.06, fy: 0.20, t: "d" }, { fx: 0.14, fy: 0.20, t: "r" }, { fx: 0.22, fy: 0.20, t: "b" }, { fx: 0.29, fy: 0.20, t: "g" },
+        { fx: 0.06, fy: 0.32, t: "s" }, { fx: 0.14, fy: 0.32, t: "d" }, { fx: 0.22, fy: 0.32, t: "r" }, { fx: 0.29, fy: 0.32, t: "b" },
+        { fx: 0.06, fy: 0.42, t: "g" }, { fx: 0.14, fy: 0.42, t: "r" }, { fx: 0.22, fy: 0.42, t: "m" }, { fx: 0.29, fy: 0.42, t: "d" },
+        // col1 bottom (16)
+        { fx: 0.39, fy: 0.59, t: "X" }, { fx: 0.46, fy: 0.59, t: "S" }, { fx: 0.54, fy: 0.59, t: "G" }, { fx: 0.61, fy: 0.59, t: "r" },
+        { fx: 0.39, fy: 0.70, t: "r" }, { fx: 0.46, fy: 0.70, t: "d" }, { fx: 0.54, fy: 0.70, t: "b" }, { fx: 0.61, fy: 0.70, t: "S" },
+        { fx: 0.39, fy: 0.82, t: "d" }, { fx: 0.46, fy: 0.82, t: "r" }, { fx: 0.54, fy: 0.82, t: "G" }, { fx: 0.61, fy: 0.82, t: "b" },
+        { fx: 0.39, fy: 0.93, t: "r" }, { fx: 0.46, fy: 0.93, t: "S" }, { fx: 0.54, fy: 0.93, t: "m" }, { fx: 0.61, fy: 0.93, t: "r" },
+        // col1 top (16)
+        { fx: 0.39, fy: 0.08, t: "x" }, { fx: 0.46, fy: 0.08, t: "D" }, { fx: 0.54, fy: 0.08, t: "x" }, { fx: 0.61, fy: 0.08, t: "S" },
+        { fx: 0.39, fy: 0.20, t: "g" }, { fx: 0.46, fy: 0.20, t: "b" }, { fx: 0.54, fy: 0.20, t: "d" }, { fx: 0.61, fy: 0.20, t: "G" },
+        { fx: 0.39, fy: 0.32, t: "r" }, { fx: 0.46, fy: 0.32, t: "d" }, { fx: 0.54, fy: 0.32, t: "b" }, { fx: 0.61, fy: 0.32, t: "r" },
+        { fx: 0.39, fy: 0.42, t: "G" }, { fx: 0.46, fy: 0.42, t: "b" }, { fx: 0.54, fy: 0.42, t: "m" }, { fx: 0.61, fy: 0.42, t: "d" },
+        // col2 bottom (16)
+        { fx: 0.72, fy: 0.59, t: "X" }, { fx: 0.80, fy: 0.59, t: "S" }, { fx: 0.88, fy: 0.59, t: "G" }, { fx: 0.96, fy: 0.59, t: "r" },
+        { fx: 0.72, fy: 0.70, t: "r" }, { fx: 0.80, fy: 0.70, t: "d" }, { fx: 0.88, fy: 0.70, t: "b" }, { fx: 0.96, fy: 0.70, t: "S" },
+        { fx: 0.72, fy: 0.82, t: "d" }, { fx: 0.80, fy: 0.82, t: "r" }, { fx: 0.88, fy: 0.82, t: "G" }, { fx: 0.96, fy: 0.82, t: "b" },
+        { fx: 0.72, fy: 0.93, t: "r" }, { fx: 0.80, fy: 0.93, t: "S" }, { fx: 0.88, fy: 0.93, t: "d" }, { fx: 0.96, fy: 0.93, t: "r" },
+        // col2 top = FINAL boss room (16 + boss)
+        { fx: 0.72, fy: 0.08, t: "x" }, { fx: 0.80, fy: 0.08, t: "X" }, { fx: 0.88, fy: 0.08, t: "x" }, { fx: 0.96, fy: 0.08, t: "S" },
+        { fx: 0.72, fy: 0.20, t: "D" }, { fx: 0.80, fy: 0.20, t: "b" }, { fx: 0.88, fy: 0.20, t: "S" }, { fx: 0.96, fy: 0.20, t: "b" },
+        { fx: 0.72, fy: 0.32, t: "S" }, { fx: 0.80, fy: 0.32, t: "b" }, { fx: 0.88, fy: 0.32, t: "G" }, { fx: 0.96, fy: 0.32, t: "b" },
+        { fx: 0.72, fy: 0.42, t: "b" }, { fx: 0.80, fy: 0.42, t: "D" }, { fx: 0.88, fy: 0.42, t: "m" }, { fx: 0.96, fy: 0.42, t: "X" },
+        { fx: 0.84, fy: 0.26, t: "k" },
+      ],
+    },
+    { // 41: CARPET BOMB — the exact same slaughterhouse, but now it RAINS.
+      //   Same enemy roster as 40; ~7 bombers per room on their own quick
+      //   cadence (bombStorm), so the floor is a constant grid of blast zones.
+      //   You survive by reading the lead points and never standing still.
+      world: { w: 3000, h: 1900 },
+      explore: true,
+      bombStorm: true,
+      bombInterval: 2.1,   // per-bomber throw cadence — many bombers = many bombs
+      player: { fx: 0.04, fy: 0.96, ammo: 6 },
+      walls: [
+        { fx: 0.329, fy: 0.00, fw: 0.008, fh: 0.16 }, { fx: 0.329, fy: 0.36, fw: 0.008, fh: 0.28 }, { fx: 0.329, fy: 0.84, fw: 0.008, fh: 0.16 },
+        { fx: 0.663, fy: 0.00, fw: 0.008, fh: 0.16 }, { fx: 0.663, fy: 0.36, fw: 0.008, fh: 0.28 }, { fx: 0.663, fy: 0.84, fw: 0.008, fh: 0.16 },
+        { fx: 0.00, fy: 0.494, fw: 0.10, fh: 0.012 }, { fx: 0.24, fy: 0.494, fw: 0.18, fh: 0.012 },
+        { fx: 0.58, fy: 0.494, fw: 0.18, fh: 0.012 }, { fx: 0.90, fy: 0.494, fw: 0.10, fh: 0.012 },
+      ],
+      enemies: [
+        // col0 bottom = start room (16, 6 bombers)
+        { fx: 0.06, fy: 0.59, t: "m" }, { fx: 0.14, fy: 0.59, t: "r" }, { fx: 0.22, fy: 0.59, t: "g" }, { fx: 0.29, fy: 0.59, t: "m" },
+        { fx: 0.06, fy: 0.70, t: "r" }, { fx: 0.14, fy: 0.70, t: "m" }, { fx: 0.22, fy: 0.70, t: "d" }, { fx: 0.29, fy: 0.70, t: "r" },
+        { fx: 0.06, fy: 0.82, t: "m" }, { fx: 0.14, fy: 0.82, t: "s" }, { fx: 0.22, fy: 0.82, t: "m" }, { fx: 0.29, fy: 0.82, t: "r" },
+        { fx: 0.10, fy: 0.93, t: "r" }, { fx: 0.18, fy: 0.93, t: "m" }, { fx: 0.25, fy: 0.93, t: "d" }, { fx: 0.30, fy: 0.90, t: "g" },
+        // col0 top (16, 7 bombers)
+        { fx: 0.06, fy: 0.08, t: "x" }, { fx: 0.14, fy: 0.08, t: "m" }, { fx: 0.22, fy: 0.08, t: "G" }, { fx: 0.29, fy: 0.08, t: "m" },
+        { fx: 0.06, fy: 0.20, t: "m" }, { fx: 0.14, fy: 0.20, t: "d" }, { fx: 0.22, fy: 0.20, t: "m" }, { fx: 0.29, fy: 0.20, t: "r" },
+        { fx: 0.06, fy: 0.32, t: "m" }, { fx: 0.14, fy: 0.32, t: "r" }, { fx: 0.22, fy: 0.32, t: "s" }, { fx: 0.29, fy: 0.32, t: "m" },
+        { fx: 0.06, fy: 0.42, t: "g" }, { fx: 0.14, fy: 0.42, t: "m" }, { fx: 0.22, fy: 0.42, t: "d" }, { fx: 0.29, fy: 0.42, t: "r" },
+        // col1 bottom (16, 7 bombers)
+        { fx: 0.39, fy: 0.59, t: "m" }, { fx: 0.46, fy: 0.59, t: "S" }, { fx: 0.54, fy: 0.59, t: "m" }, { fx: 0.61, fy: 0.59, t: "r" },
+        { fx: 0.39, fy: 0.70, t: "m" }, { fx: 0.46, fy: 0.70, t: "d" }, { fx: 0.54, fy: 0.70, t: "m" }, { fx: 0.61, fy: 0.70, t: "r" },
+        { fx: 0.39, fy: 0.82, t: "d" }, { fx: 0.46, fy: 0.82, t: "m" }, { fx: 0.54, fy: 0.82, t: "G" }, { fx: 0.61, fy: 0.82, t: "m" },
+        { fx: 0.39, fy: 0.93, t: "r" }, { fx: 0.46, fy: 0.93, t: "m" }, { fx: 0.54, fy: 0.93, t: "r" }, { fx: 0.61, fy: 0.93, t: "r" },
+        // col1 top (16, 7 bombers)
+        { fx: 0.39, fy: 0.08, t: "x" }, { fx: 0.46, fy: 0.08, t: "m" }, { fx: 0.54, fy: 0.08, t: "D" }, { fx: 0.61, fy: 0.08, t: "m" },
+        { fx: 0.39, fy: 0.20, t: "m" }, { fx: 0.46, fy: 0.20, t: "g" }, { fx: 0.54, fy: 0.20, t: "m" }, { fx: 0.61, fy: 0.20, t: "d" },
+        { fx: 0.39, fy: 0.32, t: "m" }, { fx: 0.46, fy: 0.32, t: "r" }, { fx: 0.54, fy: 0.32, t: "m" }, { fx: 0.61, fy: 0.32, t: "S" },
+        { fx: 0.39, fy: 0.42, t: "G" }, { fx: 0.46, fy: 0.42, t: "m" }, { fx: 0.54, fy: 0.42, t: "r" }, { fx: 0.61, fy: 0.42, t: "d" },
+        // col2 bottom (16, 7 bombers)
+        { fx: 0.72, fy: 0.59, t: "m" }, { fx: 0.80, fy: 0.59, t: "S" }, { fx: 0.88, fy: 0.59, t: "m" }, { fx: 0.96, fy: 0.59, t: "r" },
+        { fx: 0.72, fy: 0.70, t: "m" }, { fx: 0.80, fy: 0.70, t: "d" }, { fx: 0.88, fy: 0.70, t: "m" }, { fx: 0.96, fy: 0.70, t: "r" },
+        { fx: 0.72, fy: 0.82, t: "d" }, { fx: 0.80, fy: 0.82, t: "m" }, { fx: 0.88, fy: 0.82, t: "G" }, { fx: 0.96, fy: 0.82, t: "m" },
+        { fx: 0.72, fy: 0.93, t: "r" }, { fx: 0.80, fy: 0.93, t: "m" }, { fx: 0.88, fy: 0.93, t: "d" }, { fx: 0.96, fy: 0.93, t: "m" },
+        // col2 top = FINAL boss room (16 + boss, 7 bombers)
+        { fx: 0.72, fy: 0.08, t: "x" }, { fx: 0.80, fy: 0.08, t: "m" }, { fx: 0.88, fy: 0.08, t: "x" }, { fx: 0.96, fy: 0.08, t: "m" },
+        { fx: 0.72, fy: 0.20, t: "m" }, { fx: 0.80, fy: 0.20, t: "S" }, { fx: 0.88, fy: 0.20, t: "m" }, { fx: 0.96, fy: 0.20, t: "d" },
+        { fx: 0.72, fy: 0.32, t: "m" }, { fx: 0.80, fy: 0.32, t: "G" }, { fx: 0.88, fy: 0.32, t: "m" }, { fx: 0.96, fy: 0.32, t: "S" },
+        { fx: 0.72, fy: 0.42, t: "d" }, { fx: 0.80, fy: 0.42, t: "m" }, { fx: 0.88, fy: 0.42, t: "r" }, { fx: 0.96, fy: 0.42, t: "d" },
+        { fx: 0.84, fy: 0.26, t: "k" },
+      ],
+    },
+    { // 42: THE GAUNTLET RUN — Level 33's tactical intensity, spread across a
+      //   traversable 2x2 building. Each room ARMS when you breach it: its
+      //   garrison wakes and it spits flanking waves from its own corners, so
+      //   every doorway drops you into a fresh single-arena firefight. Tight
+      //   interior cover + a hitscan-heavy roster keep it reactive. One overall
+      //   clock (world-time) forbids turtling — clear all four rooms before it runs out.
+      world: { w: 2200, h: 1500 },
+      explore: true,
+      time: 65,   // world-seconds — burns only while you move; the anti-turtle pressure
+      player: { fx: 0.10, fy: 0.90, ammo: 6 },
+      walls: [
+        // vertical divider (fx 0.49) with doorway gaps at fy 0.18-0.32 (top) and 0.68-0.82 (bottom)
+        { fx: 0.49, fy: 0.00, fw: 0.01, fh: 0.18 }, { fx: 0.49, fy: 0.32, fw: 0.01, fh: 0.36 }, { fx: 0.49, fy: 0.82, fw: 0.01, fh: 0.18 },
+        // horizontal divider (fy 0.49) with doorway gaps at fx 0.18-0.32 (left) and 0.68-0.82 (right)
+        { fx: 0.00, fy: 0.49, fw: 0.18, fh: 0.01 }, { fx: 0.32, fy: 0.49, fw: 0.36, fh: 0.01 }, { fx: 0.82, fy: 0.49, fw: 0.18, fh: 0.01 },
+        // interior cover — two pillars per room for LOS play (Level 33 style)
+        { fx: 0.12, fy: 0.66, fw: 0.06, fh: 0.07 }, { fx: 0.30, fy: 0.80, fw: 0.06, fh: 0.07 },  // A (start, bottom-left)
+        { fx: 0.62, fy: 0.80, fw: 0.06, fh: 0.07 }, { fx: 0.82, fy: 0.66, fw: 0.06, fh: 0.07 },  // B (bottom-right)
+        { fx: 0.14, fy: 0.16, fw: 0.06, fh: 0.07 }, { fx: 0.30, fy: 0.30, fw: 0.06, fh: 0.07 },  // C (top-left)
+        { fx: 0.62, fy: 0.18, fw: 0.06, fh: 0.07 }, { fx: 0.82, fy: 0.30, fw: 0.06, fh: 0.07 },  // D (top-right, final)
+      ],
+      enemies: [   // room garrisons — dormant until you breach the room (explore + room-trigger)
+        // A (start) — + 2 bombers
+        { fx: 0.10, fy: 0.60, t: "g" }, { fx: 0.40, fy: 0.62, t: "s" }, { fx: 0.22, fy: 0.92, t: "x" }, { fx: 0.42, fy: 0.90, t: "d" },
+        { fx: 0.30, fy: 0.58, t: "m" }, { fx: 0.14, fy: 0.90, t: "m" },
+        // B — + 2 bombers
+        { fx: 0.60, fy: 0.60, t: "x" }, { fx: 0.92, fy: 0.62, t: "g" }, { fx: 0.70, fy: 0.92, t: "S" }, { fx: 0.90, fy: 0.90, t: "b" },
+        { fx: 0.78, fy: 0.58, t: "m" }, { fx: 0.62, fy: 0.92, t: "m" },
+        // C — + 2 bombers
+        { fx: 0.10, fy: 0.08, t: "X" }, { fx: 0.40, fy: 0.08, t: "g" }, { fx: 0.08, fy: 0.40, t: "s" }, { fx: 0.42, fy: 0.42, t: "d" },
+        { fx: 0.26, fy: 0.10, t: "m" }, { fx: 0.10, fy: 0.30, t: "m" },
+        // D (final) — + 2 bombers
+        { fx: 0.60, fy: 0.08, t: "x" }, { fx: 0.92, fy: 0.08, t: "X" }, { fx: 0.62, fy: 0.42, t: "b" }, { fx: 0.92, fy: 0.42, t: "S" }, { fx: 0.76, fy: 0.24, t: "g" },
+        { fx: 0.78, fy: 0.10, t: "m" }, { fx: 0.68, fy: 0.40, t: "m" },
+      ],
+      // Per-room reinforcement waves. enemy fx/fy here are fractions of THE ROOM,
+      // so 0.06 / 0.94 = that room's own corners — spawns flank you where you stand.
+      // 'after' = world-seconds since you first entered that room.
+      rooms: [
+        { fx: 0.00, fy: 0.51, fw: 0.49, fh: 0.49,   // A (start)
+          waves: [
+            { after: 2.6, enemies: [ { fx: 0.06, fy: 0.12, t: "G" }, { fx: 0.94, fy: 0.12, t: "D" }, { fx: 0.50, fy: 0.06, t: "r" } ] },
+            { after: 5.2, enemies: [ { fx: 0.06, fy: 0.55, t: "X" }, { fx: 0.94, fy: 0.55, t: "r" }, { fx: 0.55, fy: 0.94, t: "b" } ] },
+          ] },
+        { fx: 0.51, fy: 0.51, fw: 0.49, fh: 0.49,   // B
+          waves: [
+            { after: 2.2, enemies: [ { fx: 0.06, fy: 0.12, t: "G" }, { fx: 0.94, fy: 0.12, t: "X" }, { fx: 0.50, fy: 0.94, t: "r" } ] },
+            { after: 4.8, enemies: [ { fx: 0.06, fy: 0.55, t: "D" }, { fx: 0.94, fy: 0.55, t: "r" }, { fx: 0.50, fy: 0.06, t: "S" } ] },
+          ] },
+        { fx: 0.00, fy: 0.00, fw: 0.49, fh: 0.49,   // C
+          waves: [
+            { after: 2.2, enemies: [ { fx: 0.06, fy: 0.90, t: "G" }, { fx: 0.94, fy: 0.90, t: "X" }, { fx: 0.50, fy: 0.94, t: "d" } ] },
+            { after: 4.8, enemies: [ { fx: 0.06, fy: 0.45, t: "S" }, { fx: 0.94, fy: 0.45, t: "r" }, { fx: 0.50, fy: 0.06, t: "b" } ] },
+          ] },
+        { fx: 0.51, fy: 0.00, fw: 0.49, fh: 0.49,   // D (final — a three-wave crescendo)
+          waves: [
+            { after: 2.0, enemies: [ { fx: 0.06, fy: 0.90, t: "G" }, { fx: 0.94, fy: 0.90, t: "D" }, { fx: 0.50, fy: 0.94, t: "r" } ] },
+            { after: 4.4, enemies: [ { fx: 0.06, fy: 0.45, t: "X" }, { fx: 0.94, fy: 0.45, t: "X" }, { fx: 0.50, fy: 0.06, t: "S" } ] },
+            { after: 6.8, enemies: [ { fx: 0.50, fy: 0.50, t: "b" }, { fx: 0.06, fy: 0.06, t: "r" }, { fx: 0.94, fy: 0.06, t: "r" } ] },
+          ] },
+      ],
+    },
+    { // 43: THE WARDEN — our first boss-CENTRIC level. Two approach rooms
+      //   (they drain your ammo) funnel you into a full-width arena. Breaching
+      //   it wakes THE WARDEN (giant, 8 HP, radial bursts, contact-kills) AND
+      //   starts rotating flank-waves from the arena corners — so you fight the
+      //   bullet-hell and get collapsed on at once. One clock; can't kite forever.
+      world: { w: 2400, h: 1600 },
+      explore: true,
+      time: 80,   // world-seconds — long enough for the war of attrition, tight enough to forbid kiting
+      player: { fx: 0.10, fy: 0.92, ammo: 6 },
+      walls: [
+        // horizontal divider (fy 0.55): bottom = approach rooms, top = arena.
+        // doorway into the arena above Room 2 (fx 0.66-0.80).
+        { fx: 0.00, fy: 0.55, fw: 0.66, fh: 0.012 }, { fx: 0.80, fy: 0.55, fw: 0.20, fh: 0.012 },
+        // vertical divider between the two approach rooms (fx 0.50), doorway at fy 0.78-0.92
+        { fx: 0.50, fy: 0.55, fw: 0.01, fh: 0.23 }, { fx: 0.50, fy: 0.92, fw: 0.01, fh: 0.08 },
+        // approach-room cover (2 pillars each)
+        { fx: 0.14, fy: 0.70, fw: 0.05, fh: 0.07 }, { fx: 0.34, fy: 0.85, fw: 0.05, fh: 0.07 },  // Room 1
+        { fx: 0.62, fy: 0.85, fw: 0.05, fh: 0.07 }, { fx: 0.84, fy: 0.70, fw: 0.05, fh: 0.07 },  // Room 2
+        // arena cover — sparse, so the boss has room to move; just enough to break bursts
+        { fx: 0.21, fy: 0.24, fw: 0.05, fh: 0.09 }, { fx: 0.74, fy: 0.24, fw: 0.05, fh: 0.09 },
+        { fx: 0.47, fy: 0.09, fw: 0.06, fh: 0.07 },
+      ],
+      enemies: [   // garrisons — dormant until each room is breached
+        // Room 1 (start, bottom-left)
+        { fx: 0.12, fy: 0.62, t: "g" }, { fx: 0.40, fy: 0.64, t: "s" }, { fx: 0.22, fy: 0.94, t: "x" }, { fx: 0.42, fy: 0.92, t: "d" }, { fx: 0.30, fy: 0.62, t: "m" },
+        // Room 2 (bottom-right) — heavier, last resupply before the arena
+        { fx: 0.60, fy: 0.62, t: "x" }, { fx: 0.92, fy: 0.64, t: "g" }, { fx: 0.70, fy: 0.94, t: "S" }, { fx: 0.90, fy: 0.92, t: "b" }, { fx: 0.78, fy: 0.62, t: "m" },
+        // Arena (top) — THE WARDEN, flanked by two dormant snipers
+        { fx: 0.50, fy: 0.28, t: "k" }, { fx: 0.10, fy: 0.10, t: "x" }, { fx: 0.90, fy: 0.10, t: "x" },
+      ],
+      rooms: [
+        { fx: 0.00, fy: 0.55, fw: 0.50, fh: 0.45,   // Room 1 — a single flank wave
+          waves: [
+            { after: 2.6, enemies: [ { fx: 0.06, fy: 0.10, t: "G" }, { fx: 0.94, fy: 0.10, t: "D" }, { fx: 0.50, fy: 0.06, t: "r" } ] },
+          ] },
+        { fx: 0.50, fy: 0.55, fw: 0.50, fh: 0.45,   // Room 2 — two waves, the gate before the boss
+          waves: [
+            { after: 2.4, enemies: [ { fx: 0.06, fy: 0.10, t: "G" }, { fx: 0.94, fy: 0.10, t: "X" }, { fx: 0.50, fy: 0.94, t: "r" } ] },
+            { after: 5.0, enemies: [ { fx: 0.06, fy: 0.55, t: "S" }, { fx: 0.94, fy: 0.55, t: "r" } ] },
+          ] },
+        { fx: 0.00, fy: 0.00, fw: 1.00, fh: 0.55,   // Arena — rotating adds that collapse while you duel the Warden
+          waves: [
+            { after: 3.0,  enemies: [ { fx: 0.05, fy: 0.90, t: "r" }, { fx: 0.95, fy: 0.90, t: "r" } ] },
+            { after: 6.5,  enemies: [ { fx: 0.05, fy: 0.12, t: "G" }, { fx: 0.95, fy: 0.12, t: "D" } ] },
+            { after: 10.0, enemies: [ { fx: 0.50, fy: 0.92, t: "r" }, { fx: 0.07, fy: 0.50, t: "d" }, { fx: 0.93, fy: 0.50, t: "d" } ] },
+            { after: 14.5, enemies: [ { fx: 0.05, fy: 0.90, t: "r" }, { fx: 0.95, fy: 0.90, t: "r" }, { fx: 0.50, fy: 0.06, t: "S" } ] },
+          ] },
+      ],
+    },
+    { // 44: LOCK-ON — meet the SEEKER (t:"h"). It fires homing missiles that
+      //   track you; you can't sidestep them, you have to juke them into a wall
+      //   or curve them past you. A single arena packed with pillars so cover is
+      //   always a step away — the whole level is a rolling missile-dodge.
+      player: { fx: 0.50, fy: 0.90, ammo: 6 },
+      time: 40,
+      walls: [
+        { fx: 0.22, fy: 0.24, fw: 0.07, fh: 0.13 }, { fx: 0.71, fy: 0.24, fw: 0.07, fh: 0.13 },
+        { fx: 0.455, fy: 0.14, fw: 0.09, fh: 0.11 },
+        { fx: 0.29, fy: 0.54, fw: 0.11, fh: 0.10 }, { fx: 0.60, fy: 0.54, fw: 0.11, fh: 0.10 },
+        { fx: 0.14, fy: 0.66, fw: 0.09, fh: 0.11 }, { fx: 0.77, fy: 0.66, fw: 0.09, fh: 0.11 },
+      ],
+      enemies: [
+        // five seekers ringing the arena — missiles converge from every side
+        { fx: 0.12, fy: 0.13, t: "h" }, { fx: 0.88, fy: 0.13, t: "h" }, { fx: 0.50, fy: 0.07, t: "H" },
+        { fx: 0.10, fy: 0.42, t: "h" }, { fx: 0.90, fy: 0.42, t: "h" },
+        // support to keep you honest while you're busy dodging
+        { fx: 0.35, fy: 0.28, t: "d" }, { fx: 0.65, fy: 0.28, t: "d" }, { fx: 0.50, fy: 0.48, t: "g" },
+      ],
+    },
+    { // 45: HOMING SIEGE — Level 33's single-arena onslaught (its exact cover
+      //   layout, the funnest one), but seekers are woven through every wave.
+      //   Now you're breaking hitscan lines AND juking missiles at the same time,
+      //   in one room, against the clock. No traversal — pure reactive pressure.
+      player: { fx: 0.50, fy: 0.95, ammo: 6 },
+      time: 38,
+      walls: [
+        { fx: 0.20, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.70, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.44, fy: 0.16, fw: 0.12, fh: 0.10 },
+        { fx: 0.30, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.62, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.16, fy: 0.64, fw: 0.10, fh: 0.08 },
+        { fx: 0.74, fy: 0.64, fw: 0.10, fh: 0.08 },
+      ],
+      enemies: [   // opening force (10) — a seeker seeded in the middle
+        { fx: 0.12, fy: 0.12, t: "x" }, { fx: 0.88, fy: 0.12, t: "X" },
+        { fx: 0.30, fy: 0.11, t: "g" }, { fx: 0.70, fy: 0.11, t: "G" },
+        { fx: 0.50, fy: 0.28, t: "h" },
+        { fx: 0.18, fy: 0.40, t: "s" }, { fx: 0.82, fy: 0.40, t: "S" },
+        { fx: 0.40, fy: 0.22, t: "d" }, { fx: 0.60, fy: 0.22, t: "d" },
+        { fx: 0.50, fy: 0.52, t: "b" },
+      ],
+      waves: [
+        { at: 6, enemies: [   // wave 1 — flankers + a seeker (6)
+          { fx: 0.06, fy: 0.22, t: "G" }, { fx: 0.94, fy: 0.22, t: "G" },
+          { fx: 0.12, fy: 0.50, t: "r" }, { fx: 0.88, fy: 0.50, t: "r" },
+          { fx: 0.50, fy: 0.12, t: "h" }, { fx: 0.50, fy: 0.34, t: "D" },
+        ]},
+        { at: 12, enemies: [  // wave 2 — heavy answer + seeker (7)
+          { fx: 0.16, fy: 0.12, t: "X" }, { fx: 0.84, fy: 0.12, t: "X" },
+          { fx: 0.30, fy: 0.14, t: "h" }, { fx: 0.70, fy: 0.14, t: "m" },
+          { fx: 0.14, fy: 0.58, t: "b" }, { fx: 0.86, fy: 0.58, t: "b" },
+          { fx: 0.50, fy: 0.32, t: "S" },
+        ]},
+        { at: 18, enemies: [  // wave 3 — the crush, twin seekers (8)
+          { fx: 0.10, fy: 0.12, t: "h" }, { fx: 0.90, fy: 0.12, t: "h" },
+          { fx: 0.30, fy: 0.14, t: "D" }, { fx: 0.70, fy: 0.14, t: "D" },
+          { fx: 0.50, fy: 0.10, t: "m" }, { fx: 0.50, fy: 0.40, t: "b" },
+          { fx: 0.40, fy: 0.60, t: "r" }, { fx: 0.60, fy: 0.60, t: "r" },
+        ]},
+      ],
+    },
+    { // 46: MAELSTROM — pure chaos in one room. Every threat at once and lots of
+      //   each: bombs raining, missiles hunting, snipers + shotguns crossfiring,
+      //   brutes crashing in. ~50 enemies across four escalating waves. Survive
+      //   the storm, keep moving, scavenge relentlessly.
+      player: { fx: 0.50, fy: 0.95, ammo: 6 },
+      time: 52,
+      walls: [   // the funnest layout, + two extra pillars for missile-juking room
+        { fx: 0.20, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.70, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.44, fy: 0.16, fw: 0.12, fh: 0.10 },
+        { fx: 0.30, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.62, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.16, fy: 0.64, fw: 0.10, fh: 0.08 },
+        { fx: 0.74, fy: 0.64, fw: 0.10, fh: 0.08 },
+        { fx: 0.46, fy: 0.70, fw: 0.08, fh: 0.08 },
+        { fx: 0.02, fy: 0.42, fw: 0.07, fh: 0.10 },
+      ],
+      enemies: [   // opening force (15) — 3 seekers, 2 bombers, snipers + shotguns
+        { fx: 0.10, fy: 0.10, t: "x" }, { fx: 0.90, fy: 0.10, t: "X" },
+        { fx: 0.28, fy: 0.10, t: "s" }, { fx: 0.72, fy: 0.10, t: "S" },
+        { fx: 0.50, fy: 0.08, t: "g" },
+        { fx: 0.50, fy: 0.26, t: "h" }, { fx: 0.16, fy: 0.36, t: "h" }, { fx: 0.84, fy: 0.36, t: "h" },
+        { fx: 0.36, fy: 0.22, t: "d" }, { fx: 0.64, fy: 0.22, t: "d" },
+        { fx: 0.22, fy: 0.52, t: "m" }, { fx: 0.78, fy: 0.52, t: "m" },
+        { fx: 0.50, fy: 0.50, t: "b" }, { fx: 0.42, fy: 0.40, t: "g" },
+      ],
+      waves: [
+        { at: 5, enemies: [   // wave 1 — crossfire flankers (8)
+          { fx: 0.05, fy: 0.20, t: "X" }, { fx: 0.95, fy: 0.20, t: "X" },
+          { fx: 0.05, fy: 0.48, t: "r" }, { fx: 0.95, fy: 0.48, t: "r" },
+          { fx: 0.50, fy: 0.10, t: "h" }, { fx: 0.30, fy: 0.12, t: "S" }, { fx: 0.70, fy: 0.12, t: "S" },
+          { fx: 0.50, fy: 0.32, t: "m" },
+        ]},
+        { at: 10, enemies: [  // wave 2 — bombers + snipers + brutes (9)
+          { fx: 0.14, fy: 0.10, t: "m" }, { fx: 0.86, fy: 0.10, t: "m" },
+          { fx: 0.30, fy: 0.14, t: "x" }, { fx: 0.70, fy: 0.14, t: "x" },
+          { fx: 0.12, fy: 0.56, t: "b" }, { fx: 0.88, fy: 0.56, t: "b" },
+          { fx: 0.50, fy: 0.34, t: "h" }, { fx: 0.40, fy: 0.10, t: "s" }, { fx: 0.60, fy: 0.10, t: "s" },
+        ]},
+        { at: 15, enemies: [  // wave 3 — the crush, twin seekers + bombers (9)
+          { fx: 0.10, fy: 0.12, t: "h" }, { fx: 0.90, fy: 0.12, t: "h" },
+          { fx: 0.30, fy: 0.12, t: "D" }, { fx: 0.70, fy: 0.12, t: "D" },
+          { fx: 0.20, fy: 0.50, t: "m" }, { fx: 0.80, fy: 0.50, t: "m" },
+          { fx: 0.50, fy: 0.10, t: "X" }, { fx: 0.40, fy: 0.58, t: "r" }, { fx: 0.60, fy: 0.58, t: "r" },
+        ]},
+        { at: 20, enemies: [  // wave 4 — FINALE, everything on the floor at once (10)
+          { fx: 0.08, fy: 0.10, t: "x" }, { fx: 0.92, fy: 0.10, t: "x" },
+          { fx: 0.30, fy: 0.10, t: "h" }, { fx: 0.70, fy: 0.10, t: "h" },
+          { fx: 0.50, fy: 0.08, t: "m" }, { fx: 0.50, fy: 0.30, t: "m" },
+          { fx: 0.14, fy: 0.54, t: "b" }, { fx: 0.86, fy: 0.54, t: "b" },
+          { fx: 0.40, fy: 0.60, t: "S" }, { fx: 0.60, fy: 0.60, t: "S" },
+        ]},
+      ],
+    },
   ];
 
   // ---- Game state ----
@@ -996,7 +1355,7 @@
   const SPAWN_TELEGRAPH = 0.7; // world-seconds of warning before a wave lands
 
   const TYPE_MAP = { g: "gunner", s: "shotgun", x: "sniper", d: "dodger",
-                     m: "bomber", r: "rusher", b: "brute", k: "boss" };
+                     m: "bomber", r: "rusher", b: "brute", k: "boss", h: "seeker" };
 
   function loadLevel(i) {
     levelIndex = i;
@@ -1012,6 +1371,7 @@
     thrown.length = 0;
     grenades.length = 0;
     blasts.length = 0;
+    missiles.length = 0;
     obstacles = (L.walls || []).map(w => ({
       x: room.x + room.w * w.fx, y: room.y + room.h * w.fy,
       w: room.w * w.fw,          h: room.h * w.fh,
@@ -1022,6 +1382,16 @@
     // Reinforcement waves (if any): stored, spawned later at their world-time.
     levelElapsed = 0;
     pendingWaves = (L.waves || []).map(w => ({ at: w.at, enemies: w.enemies, telegraphed: false }));
+    // Room triggers: absolute rects + per-room wave queues that start on entry.
+    rooms = (L.rooms || []).map(r => ({
+      x: room.x + room.w * r.fx, y: room.y + room.h * r.fy,
+      w: room.w * r.fw,          h: room.h * r.fh,
+      fx: r.fx, fy: r.fy, fw: r.fw, fh: r.fh,
+      waves: (r.waves || []).map(w => ({
+        after: w.after, enemies: w.enemies, telegraphed: false, done: false,
+      })),
+      triggered: false, elapsed: 0,
+    }));
     spawnFx.length = 0;
     player.x = room.x + room.w * L.player.fx;
     player.y = room.y + room.h * L.player.fy;
@@ -1213,6 +1583,31 @@
             vy: Math.sin(a) * GRENADE_SPEED,
           });
         }
+      } else if (en.type === "seeker") {
+        // Fires a homing missile when it has a clean line on you. Mobile
+        // variants flank to reopen a line, same as other shooters.
+        if (en.mobile && lineBlocked(en.x, en.y, player.x, player.y)) {
+          const dir = seekAngleDir(en);
+          if (dir) { en.x += dir.x * en.moveSpeed * tdt; en.y += dir.y * en.moveSpeed * tdt; }
+          resolveCircleObstacles(en, en.r);
+          en.x = clamp(en.x, room.x + en.r, room.x + room.w - en.r);
+          en.y = clamp(en.y, room.y + en.r, room.y + room.h - en.r);
+        }
+        en.timer -= tdt;
+        const seeSeeker = !lineBlocked(en.x, en.y, player.x, player.y);
+        if (en.timer <= 0 && seeSeeker) {
+          en.timer = en.cooldown;
+          const a = en.aim;
+          const mx = en.x + Math.cos(a) * (en.r + 8);
+          const my = en.y + Math.sin(a) * (en.r + 8);
+          missiles.push({
+            x: mx, y: my, px: mx, py: my,
+            vx: Math.cos(a) * MISSILE_SPEED, vy: Math.sin(a) * MISSILE_SPEED,
+            life: MISSILE_LIFE,
+          });
+        } else if (en.timer <= 0) {
+          en.timer = 0.15;   // no LOS: re-check shortly
+        }
       } else {
         // Mobile shooter: hold position and fire when it has a clean line on
         // you. Only when its shot is BLOCKED does it move — repositioning to
@@ -1275,6 +1670,41 @@
       }
       g.x += g.vx * tdt;
       g.y += g.vy * tdt;
+    }
+
+    // Homing missiles: steer toward the player (capped turn), then advance.
+    for (let i = missiles.length - 1; i >= 0; i--) {
+      const m = missiles[i];
+      m.life -= tdt;
+      if (m.life <= 0) { spawnShatter(m.x, m.y, 2); missiles.splice(i, 1); continue; }
+      // rotate current heading toward the player, no more than MISSILE_TURN*tdt
+      const desired = Math.atan2(player.y - m.y, player.x - m.x);
+      let cur = Math.atan2(m.vy, m.vx);
+      let d = desired - cur;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      cur += clamp(d, -MISSILE_TURN * tdt, MISSILE_TURN * tdt);
+      m.vx = Math.cos(cur) * MISSILE_SPEED;
+      m.vy = Math.sin(cur) * MISSILE_SPEED;
+      m.px = m.x; m.py = m.y;
+      m.x += m.vx * tdt;
+      m.y += m.vy * tdt;
+      // contact = death
+      if (Math.hypot(m.x - player.x, m.y - player.y) <= MISSILE_R + player.r) {
+        onPlayerDeath();
+        missiles.splice(i, 1);
+        continue;
+      }
+      // detonate harmlessly on walls or when it leaves the arena (juke targets)
+      let hitWall = m.x < room.x || m.x > room.x + room.w ||
+                    m.y < room.y || m.y > room.y + room.h;
+      if (!hitWall) {
+        for (const o of obstacles) {
+          if (m.x > o.x - MISSILE_R && m.x < o.x + o.w + MISSILE_R &&
+              m.y > o.y - MISSILE_R && m.y < o.y + o.h + MISSILE_R) { hitWall = true; break; }
+        }
+      }
+      if (hitWall) { spawnShatter(m.x, m.y, 3); missiles.splice(i, 1); }
     }
 
     // Blasts: count down the fuse (time-scaled), then detonate.
@@ -1423,14 +1853,56 @@
         }
       }
     }
+    // --- Room triggers: arm a room on first entry, then run its own waves ---
+    if (state === STATE.PLAYING && rooms.length) {
+      for (const rm of rooms) {
+        if (!rm.triggered) {
+          if (player.x >= rm.x && player.x <= rm.x + rm.w &&
+              player.y >= rm.y && player.y <= rm.y + rm.h) {
+            rm.triggered = true;
+            rm.elapsed = 0;
+            // breaching arms the room: wake every garrisoned enemy inside it at once
+            for (const en of enemies) {
+              if (en.alive && !en.active &&
+                  en.x >= rm.x && en.x <= rm.x + rm.w &&
+                  en.y >= rm.y && en.y <= rm.y + rm.h) en.active = true;
+            }
+          } else continue;
+        }
+        rm.elapsed += tdt;
+        for (const wv of rm.waves) {
+          if (wv.done) continue;
+          // wave enemy coords are fractions of THIS room -> convert to world frac
+          if (!wv.telegraphed && rm.elapsed >= wv.after - SPAWN_TELEGRAPH) {
+            wv.telegraphed = true;
+            for (const e of wv.enemies) {
+              const wfx = rm.fx + rm.fw * e.fx, wfy = rm.fy + rm.fh * e.fy;
+              spawnFx.push({ x: room.x + room.w * wfx, y: room.y + room.h * wfy, t: 0 });
+            }
+          }
+          if (rm.elapsed >= wv.after) {
+            for (const e of wv.enemies) {
+              const wfx = rm.fx + rm.fw * e.fx, wfy = rm.fy + rm.fh * e.fy;
+              const en = makeEnemyFromDef({ fx: wfx, fy: wfy, t: e.t });
+              en.active = true;   // room waves spawn already awake (they land on you)
+              enemies.push(en);
+            }
+            restaggerBombers();
+            wv.done = true;
+          }
+        }
+      }
+    }
     // advance telegraph rings
     for (let i = spawnFx.length - 1; i >= 0; i--) {
       spawnFx[i].t += tdt / SPAWN_TELEGRAPH;
       if (spawnFx[i].t >= 1) spawnFx.splice(i, 1);
     }
 
-    // --- Win check: room cleared AND no more reinforcements coming ---
-    if (state === STATE.PLAYING && pendingWaves.length === 0 && enemies.every(e => !e.alive)) {
+    // --- Win check: everything dead AND no reinforcements (global or room) left ---
+    const roomWavesLeft = rooms.some(rm => rm.waves.some(w => !w.done));
+    if (state === STATE.PLAYING && pendingWaves.length === 0 && !roomWavesLeft &&
+        enemies.every(e => !e.alive)) {
       onLevelClear();
     }
   }
@@ -1497,7 +1969,7 @@
     });
   }
 
-  const DROP_AMMO = { gunner: 2, shotgun: 3, sniper: 2, dodger: 2, boss: 4 };
+  const DROP_AMMO = { gunner: 2, shotgun: 3, sniper: 2, dodger: 2, seeker: 2, boss: 4 };
   // Apply one hit. Most enemies die instantly (hp 1); bosses whittle down.
   // Returns true if the enemy died.
   function damageEnemy(en) {
@@ -1848,6 +2320,25 @@
             ctx.stroke();
           }
         }
+        // seeker: a rotating targeting reticle to read as "homing / lock-on"
+        if (en.type === "seeker") {
+          ctx.save();
+          ctx.translate(en.x, en.y);
+          ctx.rotate(performance.now() / 500);
+          ctx.strokeStyle = COL.enemyDk;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(0, 0, en.r + 6, 0, Math.PI * 2);
+          ctx.stroke();
+          for (let t = 0; t < 4; t++) {
+            const a = t * Math.PI / 2;
+            ctx.beginPath();
+            ctx.moveTo(Math.cos(a) * (en.r + 3), Math.sin(a) * (en.r + 3));
+            ctx.lineTo(Math.cos(a) * (en.r + 9), Math.sin(a) * (en.r + 9));
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
         // sniper: a long thin barrel + a faint laser sightline
         if (en.type === "sniper") {
           ctx.strokeStyle = COL.enemyDk;
@@ -1924,6 +2415,38 @@
       ctx.beginPath();
       ctx.arc(g.x, g.y, 2.6, 0, Math.PI * 2);
       ctx.fill();
+    }
+  }
+
+  function drawMissiles() {
+    for (const m of missiles) {
+      const ang = Math.atan2(m.vy, m.vx);
+      // curved motion trail (world space) — reads as "it's chasing you"
+      ctx.strokeStyle = "rgba(230,48,40,0.35)";
+      ctx.lineWidth = 3;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(m.x - Math.cos(ang) * 26, m.y - Math.sin(ang) * 26);
+      ctx.lineTo(m.x, m.y);
+      ctx.stroke();
+      // the dart: a red arrowhead pointing along its heading
+      ctx.save();
+      ctx.translate(m.x, m.y);
+      ctx.rotate(ang);
+      ctx.fillStyle = COL.enemy;
+      ctx.beginPath();
+      ctx.moveTo(8, 0);
+      ctx.lineTo(-5, -5);
+      ctx.lineTo(-2, 0);
+      ctx.lineTo(-5, 5);
+      ctx.closePath();
+      ctx.fill();
+      // dark core pip
+      ctx.fillStyle = COL.enemyDk;
+      ctx.beginPath();
+      ctx.arc(-0.5, 0, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
     }
   }
 
@@ -2057,6 +2580,7 @@
     drawShards();
     drawThrown();
     drawGrenades();
+    drawMissiles();
     drawBullets();
     drawPlayer();
     ctx.restore();
@@ -2107,19 +2631,28 @@
   }
 
   // ---- Level select ----
-  // Grid geometry is derived once so draw + click hit-testing agree.
-  function selectCells() {
+  // The grid scrolls when it outgrows the viewport (lots of levels now).
+  let selectScroll = 0;                 // px scrolled down from the top
+  const SEL_TOP = 128, SEL_BOT = H - 52; // vertical band the grid lives in
+  function selectLayout() {
     const cols = 7, n = LEVELS.length;
     const cw = 96, ch = 60, gap = 14;
     const rows = Math.ceil(n / cols);
     const gridW = cols * cw + (cols - 1) * gap;
     const gridH = rows * ch + (rows - 1) * gap;
-    const x0 = (W - gridW) / 2;
-    const y0 = (H - gridH) / 2 + 24;
+    const viewH = SEL_BOT - SEL_TOP;
+    return { cols, n, cw, ch, gap, rows, gridW, gridH, viewH,
+             x0: (W - gridW) / 2, maxScroll: Math.max(0, gridH - viewH) };
+  }
+  // Grid geometry is derived once so draw + click hit-testing agree.
+  function selectCells() {
+    const L = selectLayout();
+    selectScroll = clamp(selectScroll, 0, L.maxScroll);
+    const y0 = SEL_TOP - selectScroll;
     const cells = [];
-    for (let i = 0; i < n; i++) {
-      const c = i % cols, r = (i / cols) | 0;
-      cells.push({ idx: i, x: x0 + c * (cw + gap), y: y0 + r * (ch + gap), w: cw, h: ch });
+    for (let i = 0; i < L.n; i++) {
+      const c = i % L.cols, r = (i / L.cols) | 0;
+      cells.push({ idx: i, x: L.x0 + c * (L.cw + L.gap), y: y0 + r * (L.ch + L.gap), w: L.cw, h: L.ch });
     }
     return cells;
   }
@@ -2136,9 +2669,16 @@
     ctx.font = "14px Helvetica Neue, Arial";
     ctx.fillText("SELECT A LEVEL", W / 2, 104);
 
+    const L = selectLayout();
+    ctx.save();
+    ctx.beginPath();                       // clip so scrolled cells hide behind header/footer
+    ctx.rect(0, SEL_TOP, W, L.viewH);
+    ctx.clip();
     for (const cell of selectCells()) {
+      if (cell.y + cell.h < SEL_TOP || cell.y > SEL_BOT) continue;   // offscreen: skip
       const hot = mouse.x >= cell.x && mouse.x <= cell.x + cell.w &&
-                  mouse.y >= cell.y && mouse.y <= cell.y + cell.h;
+                  mouse.y >= cell.y && mouse.y <= cell.y + cell.h &&
+                  mouse.y >= SEL_TOP && mouse.y <= SEL_BOT;
       ctx.fillStyle = hot ? "#111" : "#c4c4c4";
       ctx.fillRect(cell.x, cell.y, cell.w, cell.h);
       ctx.strokeStyle = "#9a9a9a";
@@ -2148,10 +2688,25 @@
       ctx.font = "bold 24px Helvetica Neue, Arial";
       ctx.fillText(String(cell.idx + 1), cell.x + cell.w / 2, cell.y + cell.h / 2);
     }
+    ctx.restore();
+
+    // scrollbar (only when the grid overflows)
+    if (L.maxScroll > 0) {
+      const trackX = L.x0 + L.gridW + 16, trackY = SEL_TOP, trackH = L.viewH;
+      ctx.fillStyle = "#c9c9c9";
+      ctx.fillRect(trackX, trackY, 5, trackH);
+      const thumbH = Math.max(30, trackH * (L.viewH / L.gridH));
+      const thumbY = trackY + (trackH - thumbH) * (selectScroll / L.maxScroll);
+      ctx.fillStyle = "#8f8f8f";
+      ctx.fillRect(trackX, thumbY, 5, thumbH);
+    }
 
     ctx.fillStyle = "#888";
     ctx.font = "12px Helvetica Neue, Arial";
-    ctx.fillText("CLICK A LEVEL TO PLAY   •   PRESS ESC ANY TIME TO RETURN HERE", W / 2, H - 40);
+    const hint = L.maxScroll > 0
+      ? "CLICK A LEVEL TO PLAY   •   SCROLL FOR MORE   •   ESC RETURNS HERE"
+      : "CLICK A LEVEL TO PLAY   •   PRESS ESC ANY TIME TO RETURN HERE";
+    ctx.fillText(hint, W / 2, H - 28);
     ctx.textAlign = "left";
   }
 
