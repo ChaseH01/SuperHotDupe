@@ -1337,6 +1337,67 @@
         ]},
       ],
     },
+    { // 47: THE WARDEN'S STORM — MAELSTROM's exact chaos formula, but THE
+      //   WARDEN (8 HP, radial bursts, contact-kill) wakes mid-fight and never
+      //   leaves the floor again — you clear the rest of the storm WHILE
+      //   whittling down a boss that's still lumbering and bursting through
+      //   it. First time a boss has ever shared the arena instead of getting
+      //   its own. ~50 enemies + boss across five escalating waves.
+      player: { fx: 0.50, fy: 0.95, ammo: 6 },
+      time: 58,
+      walls: [   // MAELSTROM's layout, unchanged — proven cover, now also
+                 // doubling as the Warden's juke lanes
+        { fx: 0.20, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.70, fy: 0.28, fw: 0.10, fh: 0.10 },
+        { fx: 0.44, fy: 0.16, fw: 0.12, fh: 0.10 },
+        { fx: 0.30, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.62, fy: 0.44, fw: 0.08, fh: 0.20 },
+        { fx: 0.16, fy: 0.64, fw: 0.10, fh: 0.08 },
+        { fx: 0.74, fy: 0.64, fw: 0.10, fh: 0.08 },
+        { fx: 0.46, fy: 0.70, fw: 0.08, fh: 0.08 },
+        { fx: 0.02, fy: 0.42, fw: 0.07, fh: 0.10 },
+      ],
+      enemies: [   // opening force (16) — one heavier than MAELSTROM's, same mix
+        { fx: 0.10, fy: 0.10, t: "x" }, { fx: 0.90, fy: 0.10, t: "X" },
+        { fx: 0.28, fy: 0.10, t: "s" }, { fx: 0.72, fy: 0.10, t: "S" },
+        { fx: 0.50, fy: 0.08, t: "g" },
+        { fx: 0.50, fy: 0.26, t: "h" }, { fx: 0.16, fy: 0.36, t: "h" }, { fx: 0.84, fy: 0.36, t: "h" },
+        { fx: 0.36, fy: 0.22, t: "d" }, { fx: 0.64, fy: 0.22, t: "d" },
+        { fx: 0.22, fy: 0.52, t: "m" }, { fx: 0.78, fy: 0.52, t: "m" },
+        { fx: 0.50, fy: 0.50, t: "b" }, { fx: 0.42, fy: 0.40, t: "g" },
+        { fx: 0.58, fy: 0.40, t: "r" }, { fx: 0.50, fy: 0.62, t: "s" },
+      ],
+      waves: [
+        { at: 5, enemies: [   // wave 1 — crossfire flankers (8)
+          { fx: 0.05, fy: 0.20, t: "X" }, { fx: 0.95, fy: 0.20, t: "X" },
+          { fx: 0.05, fy: 0.48, t: "r" }, { fx: 0.95, fy: 0.48, t: "r" },
+          { fx: 0.50, fy: 0.10, t: "h" }, { fx: 0.30, fy: 0.12, t: "S" }, { fx: 0.70, fy: 0.12, t: "S" },
+          { fx: 0.50, fy: 0.32, t: "m" },
+        ]},
+        { at: 10, enemies: [  // wave 2 — bombers + snipers + brutes (10)
+          { fx: 0.14, fy: 0.10, t: "m" }, { fx: 0.86, fy: 0.10, t: "m" },
+          { fx: 0.30, fy: 0.14, t: "x" }, { fx: 0.70, fy: 0.14, t: "x" },
+          { fx: 0.12, fy: 0.56, t: "b" }, { fx: 0.88, fy: 0.56, t: "b" },
+          { fx: 0.50, fy: 0.34, t: "h" }, { fx: 0.40, fy: 0.10, t: "s" }, { fx: 0.60, fy: 0.10, t: "s" },
+          { fx: 0.50, fy: 0.58, t: "r" },
+        ]},
+        { at: 15, enemies: [  // wave 3 — THE WARDEN AWAKENS, flanked by twin
+                              // seekers and twin dodgers (5, incl. boss)
+          { fx: 0.50, fy: 0.18, t: "k" },
+          { fx: 0.10, fy: 0.12, t: "h" }, { fx: 0.90, fy: 0.12, t: "h" },
+          { fx: 0.30, fy: 0.12, t: "D" }, { fx: 0.70, fy: 0.12, t: "D" },
+        ]},
+        { at: 20, enemies: [  // wave 4 — FINALE, everything on the floor at
+                              // once, Warden still very much alive (11)
+          { fx: 0.08, fy: 0.10, t: "x" }, { fx: 0.92, fy: 0.10, t: "x" },
+          { fx: 0.30, fy: 0.10, t: "h" }, { fx: 0.70, fy: 0.10, t: "h" },
+          { fx: 0.50, fy: 0.08, t: "m" }, { fx: 0.50, fy: 0.30, t: "m" },
+          { fx: 0.14, fy: 0.54, t: "b" }, { fx: 0.86, fy: 0.54, t: "b" },
+          { fx: 0.40, fy: 0.60, t: "S" }, { fx: 0.60, fy: 0.60, t: "S" },
+          { fx: 0.50, fy: 0.54, t: "r" },
+        ]},
+      ],
+    },
   ];
 
   // ---- Game state ----
