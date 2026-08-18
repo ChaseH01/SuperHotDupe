@@ -1398,6 +1398,70 @@
         ]},
       ],
     },
+    { // 48: THE RUNNING CLOCK — the storm again, but the clock never stops.
+      //   Unlike every other timed level, this countdown burns in REAL time:
+      //   standing still no longer buys you thinking room, it just costs you.
+      //   The arena is a pinwheel — four slabs spun around a center core — so
+      //   there are no mirrored safe lanes to shuttle between; you have to keep
+      //   circling. Waves still land on WORLD time, so sprinting pulls the
+      //   whole roster onto the floor sooner while banking you real seconds.
+      //   ~43 enemies + THE WARDEN across four waves.
+      player: { fx: 0.12, fy: 0.90, ammo: 8 },
+      time: 110,
+      timeRealtime: true,   // countdown ignores bullet-time; ticks in real seconds
+      walls: [   // pinwheel: a center core with four arms spun off it, plus
+                 // asymmetric outer cover so no two corners play the same
+        { fx: 0.45, fy: 0.44, fw: 0.10, fh: 0.10 },   // core
+        { fx: 0.55, fy: 0.20, fw: 0.06, fh: 0.22 },   // arm N
+        { fx: 0.57, fy: 0.56, fw: 0.22, fh: 0.06 },   // arm E
+        { fx: 0.39, fy: 0.56, fw: 0.06, fh: 0.22 },   // arm S
+        { fx: 0.21, fy: 0.38, fw: 0.22, fh: 0.06 },   // arm W
+        { fx: 0.10, fy: 0.12, fw: 0.14, fh: 0.07 },
+        { fx: 0.78, fy: 0.10, fw: 0.08, fh: 0.14 },
+        { fx: 0.82, fy: 0.76, fw: 0.10, fh: 0.07 },
+        { fx: 0.14, fy: 0.70, fw: 0.07, fh: 0.16 },   // your break-out post
+        { fx: 0.60, fy: 0.82, fw: 0.07, fh: 0.07 },
+      ],
+      enemies: [   // opening force (13) — weighted to the far diagonal so the
+                   // first move is a run, not a standoff
+        { fx: 0.88, fy: 0.90, t: "x" }, { fx: 0.90, fy: 0.62, t: "S" },
+        { fx: 0.72, fy: 0.40, t: "g" }, { fx: 0.86, fy: 0.34, t: "s" },
+        { fx: 0.50, fy: 0.10, t: "X" }, { fx: 0.32, fy: 0.10, t: "d" },
+        { fx: 0.68, fy: 0.20, t: "h" }, { fx: 0.28, fy: 0.24, t: "m" },
+        { fx: 0.06, fy: 0.52, t: "r" }, { fx: 0.30, fy: 0.68, t: "b" },
+        { fx: 0.52, fy: 0.86, t: "g" }, { fx: 0.76, fy: 0.90, t: "d" },
+        { fx: 0.50, fy: 0.66, t: "m" },
+      ],
+      waves: [
+        { at: 5, enemies: [   // wave 1 — the spiral closes on your corner (7)
+          { fx: 0.06, fy: 0.78, t: "S" }, { fx: 0.06, fy: 0.10, t: "X" },
+          { fx: 0.94, fy: 0.10, t: "X" }, { fx: 0.34, fy: 0.94, t: "r" },
+          { fx: 0.66, fy: 0.94, t: "r" }, { fx: 0.50, fy: 0.30, t: "h" },
+          { fx: 0.24, fy: 0.50, t: "m" },
+        ]},
+        { at: 10, enemies: [  // wave 2 — bombers rain, snipers pin, brutes shove (9)
+          { fx: 0.10, fy: 0.30, t: "m" }, { fx: 0.90, fy: 0.46, t: "m" },
+          { fx: 0.30, fy: 0.06, t: "x" }, { fx: 0.70, fy: 0.06, t: "x" },
+          { fx: 0.08, fy: 0.62, t: "b" }, { fx: 0.92, fy: 0.70, t: "b" },
+          { fx: 0.46, fy: 0.94, t: "s" }, { fx: 0.90, fy: 0.20, t: "s" },
+          { fx: 0.52, fy: 0.58, t: "r" },
+        ]},
+        { at: 15, enemies: [  // wave 3 — THE WARDEN wakes on the far diagonal and
+                              // lumbers the whole length of the pinwheel at you (5)
+          { fx: 0.62, fy: 0.06, t: "k" },
+          { fx: 0.92, fy: 0.30, t: "D" }, { fx: 0.08, fy: 0.16, t: "D" },
+          { fx: 0.50, fy: 0.94, t: "h" }, { fx: 0.04, fy: 0.44, t: "h" },
+        ]},
+        { at: 20, enemies: [  // wave 4 — FINALE, every corner at once, Warden
+                              // still on the floor and the clock still running (9)
+          { fx: 0.06, fy: 0.06, t: "x" }, { fx: 0.94, fy: 0.94, t: "x" },
+          { fx: 0.28, fy: 0.90, t: "h" }, { fx: 0.72, fy: 0.34, t: "h" },
+          { fx: 0.50, fy: 0.04, t: "m" }, { fx: 0.04, fy: 0.68, t: "m" },
+          { fx: 0.36, fy: 0.50, t: "S" }, { fx: 0.70, fy: 0.72, t: "S" },
+          { fx: 0.50, fy: 0.94, t: "b" },
+        ]},
+      ],
+    },
   ];
 
   // ---- Game state ----
@@ -1409,6 +1473,9 @@
   // so it starts and flows with the SUPERHOT time mechanic. 0 = no limit.
   let levelTimeLimit = 0;
   let levelTimeLeft = 0;
+  // ...unless the level opts into a REAL-time clock (timeRealtime), which keeps
+  // ticking at wall-clock speed even while you stand frozen. No free planning.
+  let levelTimeRealtime = false;
   // Reinforcement waves: extra enemies that spawn at world-time marks.
   let levelElapsed = 0;       // world-seconds since the level started
   let pendingWaves = [];      // [{ at, enemies:[def], telegraphed }]
@@ -1461,6 +1528,7 @@
     player.hasGun = player.ammo > 0;   // start armed only if the level grants ammo
     levelTimeLimit = L.time || 0;
     levelTimeLeft = levelTimeLimit;
+    levelTimeRealtime = !!L.timeRealtime;
     timeScale = 0;
     hitFlash = 0;
     meleeSwing = 0;
@@ -1889,9 +1957,10 @@
 
     if (hitFlash > 0) hitFlash = Math.max(0, hitFlash - dt * 2.5);
 
-    // --- Survival clock: burns down in world time (only while you move) ---
+    // --- Survival clock: burns down in world time (only while you move),
+    //     or in real time if the level asked for it (levelTimeRealtime) ---
     if (levelTimeLimit > 0 && state === STATE.PLAYING) {
-      levelTimeLeft -= tdt;
+      levelTimeLeft -= levelTimeRealtime ? dt : tdt;
       if (levelTimeLeft <= 0) { levelTimeLeft = 0; onPlayerDeath(); }
     }
 
@@ -2657,7 +2726,7 @@
 
   function drawSurvivalClock() {
     if (levelTimeLimit <= 0 || state === STATE.SELECT) return;
-    const low = levelTimeLeft <= 5;
+    const low = levelTimeLeft <= (levelTimeRealtime ? 10 : 5);
     ctx.fillStyle = low ? COL.enemy : "#333";
     ctx.font = "bold 22px Helvetica Neue, Arial";
     ctx.textAlign = "center";
@@ -2665,7 +2734,7 @@
     ctx.fillText(levelTimeLeft.toFixed(1) + "s", W / 2, 44);
     ctx.font = "10px Helvetica Neue, Arial";
     ctx.fillStyle = "#888";
-    ctx.fillText("TIME LEFT", W / 2, 68);
+    ctx.fillText(levelTimeRealtime ? "REAL TIME LEFT" : "TIME LEFT", W / 2, 68);
     ctx.textAlign = "left";
   }
 
